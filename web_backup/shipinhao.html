@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>视频号视频解析 - HotVideo</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary-color: #FA9D2B;  /* 微信视频号橙色 */
+            --primary-hover: #E88A1A;
+            --bg-color: #f5f5f5;
+            --card-bg: #ffffff;
+            --text-primary: #1a1a1a;
+            --text-secondary: #666666;
+            --border-color: #e8e8e8;
+            --success-color: #52c41a;
+            --error-color: #ff4d4f;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+            background: var(--bg-color);
+            min-height: 100vh;
+            color: var(--text-primary);
+        }
+
+        /* 头部 */
+        .header {
+            background: linear-gradient(135deg, var(--primary-color) 0%, #FFB84D 100%);
+            padding: 60px 20px;
+            text-align: center;
+            box-shadow: 0 4px 12px rgba(250, 157, 43, 0.3);
+        }
+
+        .header h1 {
+            color: white;
+            font-size: 32px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+
+        .header p {
+            color: rgba(255, 255, 255, 0.9);
+            font-size: 14px;
+        }
+
+        /* Logo 图标 */
+        .logo-icon {
+            width: 64px;
+            height: 64px;
+            margin: 0 auto 16px;
+            background: white;
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+
+        .logo-icon svg {
+            width: 40px;
+            height: 40px;
+        }
+
+        /* 主内容区 */
+        .main-content {
+            max-width: 800px;
+            margin: -30px auto 0;
+            padding: 0 20px 40px;
+        }
+
+        /* 搜索卡片 */
+        .search-card {
+            background: var(--card-bg);
+            border-radius: 16px;
+            padding: 32px;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+            margin-bottom: 24px;
+        }
+
+        .search-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 20px;
+            color: var(--text-primary);
+        }
+
+        .search-input-group {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .search-input {
+            flex: 1;
+            height: 48px;
+            border: 2px solid var(--border-color);
+            border-radius: 12px;
+            padding: 0 16px;
+            font-size: 15px;
+            transition: all 0.3s;
+            outline: none;
+        }
+
+        .search-input:focus {
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(250, 157, 43, 0.1);
+        }
+
+        .search-input::placeholder {
+            color: #bbb;
+        }
+
+        .search-btn {
+            height: 48px;
+            padding: 0 32px;
+            background: var(--primary-color);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            font-size: 15px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .search-btn:hover {
+            background: var(--primary-hover);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(250, 157, 43, 0.3);
+        }
+
+        .search-btn:active {
+            transform: translateY(0);
+        }
+
+        .search-btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        /* 提示文字 */
+        .hint-text {
+            font-size: 13px;
+            color: var(--text-secondary);
+            line-height: 1.6;
+        }
+
+        .hint-text a {
+            color: var(--primary-color);
+            text-decoration: none;
+        }
+
+        .hint-text a:hover {
+            text-decoration: underline;
+        }
+
+        /* 结果卡片 */
+        .result-card {
+            background: var(--card-bg);
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+            display: none;
+        }
+
+        .result-card.show {
+            display: block;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .result-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+
+        .result-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .result-icon.success {
+            background: rgba(82, 196, 26, 0.1);
+            color: var(--success-color);
+        }
+
+        .result-icon.error {
+            background: rgba(255, 77, 79, 0.1);
+            color: var(--error-color);
+        }
+
+        .result-title {
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        /* 结果信息列表 */
+        .info-list {
+            display: grid;
+            gap: 12px;
+        }
+
+        .info-item {
+            display: flex;
+            padding: 12px 16px;
+            background: #fafafa;
+            border-radius: 10px;
+            border: 1px solid var(--border-color);
+        }
+
+        .info-label {
+            width: 100px;
+            font-size: 13px;
+            color: var(--text-secondary);
+            flex-shrink: 0;
+        }
+
+        .info-value {
+            flex: 1;
+            font-size: 14px;
+            color: var(--text-primary);
+            word-break: break-all;
+        }
+
+        .info-value a {
+            color: var(--primary-color);
+            text-decoration: none;
+        }
+
+        .info-value a:hover {
+            text-decoration: underline;
+        }
+
+        /* 错误信息 */
+        .error-message {
+            color: var(--error-color);
+            font-size: 14px;
+            padding: 16px;
+            background: rgba(255, 77, 79, 0.05);
+            border-radius: 10px;
+            border: 1px solid rgba(255, 77, 79, 0.2);
+        }
+
+        /* 注意提示 */
+        .notice-box {
+            margin-top: 20px;
+            padding: 16px;
+            background: rgba(250, 157, 43, 0.05);
+            border-radius: 10px;
+            border: 1px solid rgba(250, 157, 43, 0.2);
+        }
+
+        .notice-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--primary-color);
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .notice-text {
+            font-size: 13px;
+            color: var(--text-secondary);
+            line-height: 1.6;
+        }
+
+        /* Loading 动画 */
+        .loading {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        /* 响应式 */
+        @media (max-width: 600px) {
+            .header {
+                padding: 40px 16px;
+            }
+
+            .header h1 {
+                font-size: 24px;
+            }
+
+            .search-card {
+                padding: 20px;
+            }
+
+            .search-input-group {
+                flex-direction: column;
+            }
+
+            .search-btn {
+                width: 100%;
+                justify-content: center;
+            }
+
+            .info-item {
+                flex-direction: column;
+                gap: 4px;
+            }
+
+            .info-label {
+                width: auto;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- 头部 -->
+    <header class="header">
+        <div class="logo-icon">
+            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" fill="#FA9D2B"/>
+            </svg>
+        </div>
+        <h1>视频号视频解析</h1>
+        <p>输入视频号链接，快速解析视频信息</p>
+    </header>
+
+    <!-- 主内容 -->
+    <main class="main-content">
+        <!-- 搜索卡片 -->
+        <div class="search-card">
+            <div class="search-title">解析视频号链接</div>
+            <div class="search-input-group">
+                <input type="text" class="search-input" id="urlInput"
+                       placeholder="粘贴视频号链接，如：https://weixin.qq.com/sph/xxxxxxxx">
+                <button class="search-btn" id="parseBtn" onclick="parseLink()">
+                    <span>解析链接</span>
+                </button>
+            </div>
+            <div class="hint-text">
+                支持格式：<br>
+                • <code>https://weixin.qq.com/sph/视频ID</code> <br>
+                • <code>https://channels.weixin.qq.com/finder-preview/pages/sph?id=视频ID</code>
+            </div>
+        </div>
+
+        <!-- 结果卡片 -->
+        <div class="result-card" id="resultCard">
+            <div class="result-header">
+                <div class="result-icon success" id="resultIcon">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                        <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" fill="currentColor"/>
+                    </svg>
+                </div>
+                <div class="result-title" id="resultTitle">解析成功</div>
+            </div>
+
+            <div class="info-list" id="infoList">
+                <!-- 动态填充 -->
+            </div>
+
+            <div class="notice-box" id="noticeBox">
+                <div class="notice-title">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z" fill="currentColor"/>
+                    </svg>
+                    提示
+                </div>
+                <div class="notice-text" id="noticeText">
+                    视频号内容需要微信登录态才能访问完整信息。当前仅解析链接格式，提取视频ID。
+                </div>
+            </div>
+        </div>
+
+        <!-- 错误卡片 -->
+        <div class="result-card" id="errorCard">
+            <div class="result-header">
+                <div class="result-icon error">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z" fill="currentColor"/>
+                    </svg>
+                </div>
+                <div class="result-title">解析失败</div>
+            </div>
+            <div class="error-message" id="errorMessage"></div>
+        </div>
+    </main>
+
+    <script>
+        const urlInput = document.getElementById('urlInput');
+        const parseBtn = document.getElementById('parseBtn');
+        const resultCard = document.getElementById('resultCard');
+        const errorCard = document.getElementById('errorCard');
+        const resultIcon = document.getElementById('resultIcon');
+        const resultTitle = document.getElementById('resultTitle');
+        const infoList = document.getElementById('infoList');
+        const noticeBox = document.getElementById('noticeBox');
+        const noticeText = document.getElementById('noticeText');
+        const errorMessage = document.getElementById('errorMessage');
+
+        // 回车触发解析
+        urlInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                parseLink();
+            }
+        });
+
+        // 粘贴自动触发
+        urlInput.addEventListener('paste', function() {
+            setTimeout(() => parseLink(), 100);
+        });
+
+        async function parseLink() {
+            const url = urlInput.value.trim();
+
+            if (!url) {
+                showError('请输入视频号链接');
+                return;
+            }
+
+            // 显示 loading
+            parseBtn.disabled = true;
+            parseBtn.innerHTML = '<span class="loading"></span><span>解析中...</span>';
+
+            // 隐藏之前的结果
+            resultCard.classList.remove('show');
+            errorCard.classList.remove('show');
+
+            try {
+                const response = await fetch('/api/shipinhao/parse-link', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ url: url })
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.status === 'success') {
+                    showResult(data);
+                } else {
+                    showError(data.detail || data.error || '解析失败');
+                }
+
+            } catch (error) {
+                showError('网络请求失败: ' + error.message);
+            } finally {
+                // 恢复按钮
+                parseBtn.disabled = false;
+                parseBtn.innerHTML = '<span>解析链接</span>';
+            }
+        }
+
+        function showResult(data) {
+            // 填充信息
+            const infoItems = [
+                { label: '视频ID', value: data.video_id },
+                { label: '原始链接', value: `<a href="${data.original_url}" target="_blank">${data.original_url}</a>` },
+                { label: 'Finder链接', value: `<a href="${data.finder_url}" target="_blank">${data.finder_url}</a>` },
+                { label: '平台', value: data.platform }
+            ];
+
+            infoList.innerHTML = infoItems.map(item => `
+                <div class="info-item">
+                    <div class="info-label">${item.label}</div>
+                    <div class="info-value">${item.value}</div>
+                </div>
+            `).join('');
+
+            // 显示提示
+            if (data.note) {
+                noticeText.textContent = data.note;
+                noticeBox.style.display = 'block';
+            } else {
+                noticeBox.style.display = 'none';
+            }
+
+            // 显示结果卡片
+            resultCard.classList.add('show');
+        }
+
+        function showError(message) {
+            errorMessage.textContent = message;
+            errorCard.classList.add('show');
+        }
+    </script>
+</body>
+</html>

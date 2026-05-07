@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+env/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Runtime data
+data/audio/
+data/browser_profiles/
+data/output/
+data/postgres/
+data/redis/
+data/thumbnails/
+data/videos/
+data/web/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup
+*.bak
+docker-compose.yml.bak
+docker-compose.yml.bak21

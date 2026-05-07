@@ -1,0 +1,118 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16
+    container_name: hotvideo-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hotvideo
+      POSTGRES_PASSWORD: Hotvideo123!
+      POSTGRES_DB: hotvideo
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    ports:
+      - "25432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hotvideo"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hotvideo-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: hotvideo-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - ./data/redis:/data
+    ports:
+      - "26379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hotvideo-net
+
+  api:
+    build: ./api  # 修改：使用本地构建
+    # image: hotvideo-api:latest  # 注释掉原有镜像
+    container_name: hotvideo-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://hotvideo:Hotvideo123!@db:5432/hotvideo
+      - REDIS_URL=redis://redis:6379/0
+      - HEADLESS=false
+      - MAX_BROWSER_INSTANCES=5
+      - SECRET_KEY=hotvideo-secret-key-change-in-production
+      - HOST_IP=101.43.94.39
+      - VNC_PORT_OFFSET=20000
+      - ASR_ENGINE=siliconflow
+      - SILICONFLOW_API_KEY=sk-fbmjkfnzenpyatpycmhisqhkmoxeoipspchkjtquhfqxqmhp
+      - SILICONFLOW_MODEL=FunAudioLLM/SenseVoiceSmall
+      - SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1/audio/transcriptions
+      - SILICONFLOW_TIMEOUT=120
+      - MITMPROXY_PORT=8080  # 新增：mitmproxy 端口
+    volumes:
+      - ./data/browser_profiles:/app/data/browser_profiles
+      - ./data/videos:/app/data/videos
+      - ./data/audio:/app/data/audio
+      - ./data/output:/app/data/output
+      - ./data/thumbnails:/app/data/thumbnails
+      - ./logs:/app/logs
+      - ./api/asr:/app/asr
+      - ./api/config:/app/config
+      - ./api/.env:/app/.env
+    ports:
+      - "25050:8000"           # API 服务
+      - "25900-25910:5900-5910" # VNC
+      - "26080-26090:6080-6090" # noVNC
+      - "28080:8080"           # 新增：mitmproxy 端口
+    shm_size: 2gb
+    init: true
+    command: >
+      bash -c "rm -rf /app/data/browser_profiles/*/Singleton* /tmp/.X*-lock 2>/dev/null;
+      Xvfb :99 -screen 0 1920x1080x24 &
+      sleep 2 &&
+      export DISPLAY=:99 &&
+      vncserver :99 -geometry 1920x1080 -depth 24 -SecurityTypes None 2>/dev/null || true &&
+      sleep 1 &&
+      websockify --web=/usr/share/novnc 6080 localhost:5900 &
+      sleep 1 &&
+      exec python main.py server --host 0.0.0.0 --port 8000"
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+    networks:
+      - hotvideo-net
+
+  web:
+    image: nginx:alpine
+    container_name: hotvideo-web
+    restart: unless-stopped
+    depends_on:
+      - api
+    volumes:
+      - ./web:/usr/share/nginx/html:ro
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    ports:
+      - "25080:80"
+      - "25443:443"
+    networks:
+      - hotvideo-net
+
+networks:
+  hotvideo-net:
+    driver: bridge
