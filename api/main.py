@@ -112,11 +112,11 @@ crawler_manager = UserCrawlerManager()
 _cleanup_task = None
 
 async def _periodic_browser_cleanup():
-    """定时清理浏览器池（每5分钟）"""
+    """定时清理浏览器池（每10分钟检查，空闲超1小时则关闭）"""
     from crawler.browser_pool import browser_pool
     while True:
         try:
-            await asyncio.sleep(300)  # 每5分钟检查一次
+            await asyncio.sleep(600)  # 每10分钟检查一次
             async with browser_pool._lock:
                 await browser_pool._cleanup_idle()
                 memory_percent = __import__("psutil").virtual_memory().percent / 100
@@ -632,6 +632,26 @@ async def api_get_user_transactions(
 
 # ============ 原有API接口 ============
 
+
+@app.get("/api/vnc-url")
+async def get_vnc_url(
+    platform: str = "douyin",
+    current_user: User = Depends(get_current_user)
+):
+    """获取当前用户对应平台的 noVNC 观察地址"""
+    settings = get_settings()
+    host = settings.HOST_IP
+    cdp_port = settings.get_user_cdp_port(current_user.id, platform)
+    novnc_port = cdp_port - 9222 + 26080
+    vnc_url = f"http://{host}:{novnc_port}/vnc.html?autoconnect=true&resize=scale"
+    return {
+        "vnc_url": vnc_url,
+        "cdp_port": cdp_port,
+        "novnc_port": novnc_port,
+        "user_id": current_user.id,
+        "platform": platform,
+    }
+
 @app.get("/api/status")
 async def get_status(current_user: User = Depends(get_current_user)):
     """获取服务状态"""
@@ -903,6 +923,21 @@ async def log_frontend_error(
 
 
 @app.get("/api/login")
+@app.get("/api/ensure-browser")
+async def ensure_browser_running(
+    platform: str = "douyin",
+    current_user: User = Depends(get_current_user)
+):
+    """确保浏览器进程已启动（不导航页面，不影响当前任务）"""
+    crawler = get_crawler(platform, current_user.id)
+    try:
+        await crawler.ensure_browser()
+        return {"message": "浏览器已就绪", "status": "ok"}
+    except Exception as e:
+        logger.error(f"启动浏览器失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/open-login")  # 前端兼容别名
 async def open_login_page(platform: str = "douyin",
     force: bool = False, current_user: User = Depends(get_current_user)):
@@ -1411,45 +1446,61 @@ async def create_browser_session(
 
 @app.get("/api/session/status")
 async def get_session_status(
-    platform: str = "douyin",
-    force: bool = False,
-    debug: bool = Query(True, description="调试模式"),
     current_user: User = Depends(get_current_user)
 ):
-    """获取当前会话状态"""
-    session = await unified_session_manager.get_session(current_user.id, debug=debug)
-    
-    if not session:
-        return {
-            "has_session": False,
-            "message": "没有活跃的会话"
-        }
-    
-    login_status = await unified_session_manager.check_login_status(
-        current_user.id, 
-        platform
-    )
-    
+    """获取会话资源使用情况（browser_pool 真实数据）"""
+    from crawler.browser_pool import browser_pool
+    import psutil, subprocess
+
+    stats = browser_pool.get_stats()
+
+    # 统计系统内 chromium 进程数
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "remote-debugging-port"],
+            capture_output=True, text=True
+        )
+        browser_processes = len([p for p in result.stdout.strip().split("\n") if p]) if result.stdout.strip() else 0
+    except Exception:
+        browser_processes = stats["total_instances"]
+
+    # 内存占用（MB）
+    memory = psutil.virtual_memory()
+    memory_used_mb = round((memory.total - memory.available) / 1024 / 1024)
+
     return {
-        "has_session": True,
-        "session_id": session["session_id"],
-        "platform": session["platform"],
-        "status": session["status"],
-        "cdp_port": session.get("cdp_port"),
-        "created_at": session["created_at"].isoformat(),
-        "login_status": login_status
+        "success": True,
+        "session_count": stats["total_instances"],
+        "max_sessions": stats.get("max_instances", 10),
+        "browser_processes": browser_processes,
+        "memory_mb": memory_used_mb,
+        "memory_percent": round(memory.percent, 1),
+        "warning": stats["total_instances"] >= stats.get("max_instances", 10),
+        "instances": stats.get("instances", [])
     }
 
 
 @app.delete("/api/session")
 async def destroy_browser_session(current_user: User = Depends(get_current_user)):
-    """销毁浏览器会话"""
-    success = await unified_session_manager.destroy_session(current_user.id)
-    
-    if success:
-        return {"success": True, "message": "会话已销毁"}
-    else:
-        return {"success": False, "message": "没有活跃的会话"}
+    """销毁浏览器会话（同时清理 browser_pool 和 session 字典）"""
+    from crawler.browser_pool import browser_pool
+    import subprocess as _sp
+
+    # 1. 清理 browser_pool 里该用户的所有实例（含 chromium 进程）
+    removed = 0
+    async with browser_pool._lock:
+        to_remove = [k for k in list(browser_pool._instances.keys()) if k[0] == current_user.id]
+        for key in to_remove:
+            await browser_pool._close_instance(key, "用户清理会话")
+            removed += 1
+
+    # 2. 清理 session 字典（可能为空，忽略返回值）
+    await unified_session_manager.destroy_session(current_user.id)
+
+    # 3. 兜底：pkill 残余 chromium
+    _sp.run(["pkill", "-9", "-f", "chromium"], capture_output=True)
+
+    return {"success": True, "message": f"已清理 {removed} 个浏览器实例及相关会话"}
 
 
 @app.get("/api/session/list")
@@ -1461,17 +1512,6 @@ async def list_browser_sessions(
     sessions = await unified_session_manager.list_sessions(debug=debug)
     return {"sessions": sessions}
 
-
-
-@app.get("/api/session/status")
-async def get_session_status(current_user: User = Depends(get_current_user)):
-    """获取会话资源使用情况"""
-    usage = session_monitor.get_resource_usage(unified_session_manager)
-    return {
-        "success": True,
-        **usage,
-        "warning": usage["session_count"] >= usage["max_sessions"]
-    }
 
 
 @app.get("/api/browser-pool/status")
@@ -1778,7 +1818,7 @@ async def get_search_task_status(
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
     
-    if task["user_id"] != current_user.id and current_user.role != UserRole.ADMIN:
+    if task["user_id"] != current_user.id :
         raise HTTPException(status_code=403, detail="无权访问此任务")
     
     return task
@@ -1795,7 +1835,7 @@ async def cancel_search_task(
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
     
-    if task["user_id"] != current_user.id and current_user.role != UserRole.ADMIN:
+    if task["user_id"] != current_user.id :
         raise HTTPException(status_code=403, detail="无权取消此任务")
     
     if task["status"] not in ["pending", "running"]:
@@ -1965,6 +2005,25 @@ async def search_by_url(
     except Exception as e:
         logger.error(f"基于链接搜索失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/search/url")
+async def search_by_url_get(
+    video_url: str,
+    platform: str = "douyin",
+    content_type: str = "video",
+    timeout: int = None,
+    current_user: User = Depends(get_current_user)
+):
+    """基于视频链接搜索（GET兼容接口）"""
+    request = SearchByUrlRequest(
+        video_url=video_url,
+        platform=platform,
+        content_type=content_type,
+        timeout=timeout
+    )
+    return await search_by_url(request, current_user)
+
+
 
 @app.post("/api/transcript")
 async def transcript_video(
@@ -3877,6 +3936,143 @@ async def analyze_viral_video(
         raise
     except Exception as e:
         logger.error(f"爆款视频分析失败: {e}")
+        raise HTTPException(status_code=500, detail=f"分析失败: {str(e)}")
+    finally:
+        session.close()
+
+
+@app.post("/api/videos/{video_id}/visual-analyze")
+async def visual_analyze_viral_video(
+    video_id: str,
+    platform: str = "douyin",
+    force: bool = False,
+    num_frames: int = 3,
+    current_user: User = Depends(get_current_user)
+):
+    """视觉增强型爆款分析：截帧+视觉模型+文案 → 爆点+创作提示词"""
+    require_license()
+
+    session = get_platform_session(platform)
+    ModelClass = PLATFORM_MODELS.get(platform)
+    if not ModelClass:
+        raise HTTPException(status_code=400, detail=f"不支持的平台: {platform}")
+
+    try:
+        record = session.query(ModelClass).filter_by(video_id=video_id).first()
+        if not record:
+            raise HTTPException(status_code=404, detail="视频不存在")
+
+        # === 爆款阈值检查 ===
+        # 计算互动加权分数：点赞0.5 + 评论0.3 + 分享0.2 + 收藏0.1
+        likes = record.likes or 0
+        comments = record.comments or 0
+        shares = record.shares or 0
+        collects = record.collects or 0
+        
+        viral_score = (
+            likes * 0.5 + 
+            comments * 0.3 + 
+            shares * 0.2 + 
+            collects * 0.1
+        )
+        
+        MIN_VIRAL_SCORE = 5000  # 最低爆款分数阈值
+        
+        if viral_score < MIN_VIRAL_SCORE :
+            logger.info(f"视频 {video_id} 互动量不足: 分数={viral_score:.0f}")
+            raise HTTPException(
+                status_code=400, 
+                detail=f"该视频互动量不足，不具备爆款分析价值。当前分数：{viral_score:.0f}，最低要求：{MIN_VIRAL_SCORE}。互动数据：点赞 {likes:,} | 评论 {comments:,} | 分享 {shares:,} | 收藏 {collects:,}"
+            )
+        
+        logger.info(f"视频 {video_id} 通过爆款阈值检查: 分数={viral_score:.0f}")
+        # === 阈值检查结束 ===
+
+        # 已有结果且不强制重新分析
+        if not force and record.viral_points:
+            logger.info(f"返回已有视觉分析结果: {video_id}")
+            return {
+                "video_id": video_id,
+                "cached": True,
+                "has_video": record.frames_analyzed is not None and record.frames_analyzed > 0,
+                "frames_analyzed": record.frames_analyzed or 0,
+                "visual_result": {
+                    "visual_description": record.visual_description or "",
+                    "scene_types": json.loads(record.scene_types) if record.scene_types else [],
+                    "visual_highlights": json.loads(record.visual_highlights) if record.visual_highlights else [],
+                    "cinematography": record.cinematography or "",
+                } if record.visual_description else None,
+                "viral_points": json.loads(record.viral_points) if record.viral_points else [],
+                "visual_hooks": json.loads(record.visual_hooks) if record.visual_hooks else [],
+                "content_hooks": json.loads(record.content_hooks) if record.content_hooks else [],
+                "emotion_triggers": json.loads(record.emotion_triggers) if record.emotion_triggers else [],
+                "target_audience": record.target_audience or "",
+                "creation_prompt": record.creation_prompt or "",
+                "replication_tips": json.loads(record.replication_tips) if record.replication_tips else [],
+            }
+
+        # 积分检查（管理员跳过）
+        if current_user.role != UserRole.ADMIN:
+            if not CreditManager.check_credits(current_user.id, 20):
+                raise HTTPException(status_code=403, detail="积分不足，视觉分析需要 20 积分")
+
+        # 执行视觉增强分析
+        from analyzer.visual_analyzer import VisualViralAnalyzer
+        settings = get_settings()
+
+        analyzer = VisualViralAnalyzer(
+            api_key=settings.ZHIPU_API_KEY,
+            base_url=settings.ZHIPU_BASE_URL or "https://open.bigmodel.cn/api/paas/v4",
+            vision_model=settings.ZHIPU_MODEL or "GLM-4.1V-Thinking-Flash",
+            text_model="glm-4-flash",
+            videos_dir=str(settings.VIDEOS_DIR),
+        )
+
+        result = analyzer.analyze(
+            video_id=video_id,
+            title=record.description or "",
+            transcript=record.transcript or "",
+            likes=record.likes or 0,
+            comments=record.comments or 0,
+            shares=record.shares or 0,
+            collects=record.collects or 0,
+            author_name=record.author_name or "",
+            fans_count=str(record.fans_count or "0"),
+            platform=platform,
+            num_frames=num_frames,
+        )
+
+        # 保存到数据库
+        if result.get("visual_result"):
+            vr = result["visual_result"]
+            record.visual_description = vr.get("visual_description", "")
+            record.scene_types = json.dumps(vr.get("scene_types", []), ensure_ascii=False)
+            record.visual_highlights = json.dumps(vr.get("visual_highlights", []), ensure_ascii=False)
+            record.cinematography = vr.get("cinematography", "")
+        record.viral_points = json.dumps(result.get("viral_points", []), ensure_ascii=False)
+        record.visual_hooks = json.dumps(result.get("visual_hooks", []), ensure_ascii=False)
+        record.content_hooks = json.dumps(result.get("content_hooks", []), ensure_ascii=False)
+        record.emotion_triggers = json.dumps(result.get("emotion_triggers", []), ensure_ascii=False)
+        record.target_audience = result.get("target_audience", "")
+        record.creation_prompt = result.get("creation_prompt", "")
+        record.replication_tips = json.dumps(result.get("replication_tips", []), ensure_ascii=False)
+        record.frames_analyzed = result.get("frames_analyzed", 0)
+        session.commit()
+        logger.info(f"视觉分析结果已保存: {video_id}")
+
+        # 扣积分
+        if current_user.role != UserRole.ADMIN:
+            CreditManager.deduct_credits(
+                current_user.id, 20, TransactionType.ANALYZE,
+                description=f"视觉爆款分析: {video_id}", related_id=video_id
+            )
+
+        return {"video_id": video_id, "cached": False, **result}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"视觉爆款分析失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"分析失败: {str(e)}")
     finally:
         session.close()
