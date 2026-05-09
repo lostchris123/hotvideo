@@ -3,6 +3,33 @@
 ## 🎯 项目简介
 **免费一键提取抖音、小红书视频文案**，基于 AI 视觉理解和内容分析的短视频爆款研究平台，自动分析抖音/小红书爆款视频的成功机制，并生成可直接使用的 AI 视频创作提示词。
 
+## 📸 功能展示
+
+<div align="center">
+  <img src="docs/images/bushou1.jpg" alt="功能展示1" width="45%" />
+  <img src="docs/images/bushou2.jpg" alt="功能展示2" width="45%" />
+</div>
+
+<div align="center">
+  <img src="docs/images/bushou3.jpg" alt="功能展示3" width="45%" />
+  <img src="docs/images/bushou4.jpg" alt="功能展示4" width="45%" />
+</div>
+
+<div align="center">
+  <img src="docs/images/bushou5.jpg" alt="功能展示5" width="45%" />
+  <img src="docs/images/bushou6.jpg" alt="功能展示6" width="45%" />
+</div>
+
+<div align="center">
+  <img src="docs/images/bushou7.jpg" alt="功能展示7" width="45%" />
+  <img src="docs/images/bushou8.jpg" alt="功能展示8" width="45%" />
+</div>
+
+<div align="center">
+  <img src="docs/images/bushou9.jpg" alt="功能展示9" width="45%" />
+  <img src="docs/images/bushou10.jpg" alt="功能展示10" width="45%" />
+</div>
+
 ## ✨ 核心功能
 
 ### 📝 免费一键提取文案（核心功能）
