@@ -4,6 +4,7 @@
 from __future__ import annotations
 import asyncio
 import re
+import random
 import json
 import httpx
 import urllib.parse
@@ -76,6 +77,12 @@ class VideoInfo:
             duration=self.duration,
             keyword=keyword,
         )
+
+
+async def _random_sleep(min_sec: float = 1.0, max_sec: float = 3.0):
+    """随机延迟辅助函数"""
+    import random
+    await asyncio.sleep(random.uniform(min_sec, max_sec))
 
 
 class DouyinCrawler:
@@ -254,7 +261,7 @@ class DouyinCrawler:
         
         try:
             await self._page.goto(video_url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(3)
+            await asyncio.sleep(random.uniform(2.0, 4.0))
             
             stream_data = await self._page.evaluate("""
                 () => {
@@ -545,17 +552,31 @@ class DouyinCrawler:
         except Exception as e:
             logger.warning(f"页面导航异常: {e}，尝试继续...")
         
-        await asyncio.sleep(3)
-        
-        # 等待搜索结果加载 - 使用多种选择器
+        await asyncio.sleep(random.uniform(2.5, 5.0))
+        # 保存调试截图确认页面状态
+        await self._save_debug_screenshot(f"search_{keyword[:10]}_after_goto")
+        logger.info(f"搜索后页面URL: {self._page.url}")
+
+        # === 第一优先：检测验证码（在等待搜索结果之前）===
+        has_captcha = await self._check_captcha()
+        if has_captcha:
+            await self._save_debug_screenshot("captcha_detected")
+            logger.error("检测到图形验证码！请打开 noVNC 手动完成验证后重试")
+            from config import get_settings as _gs
+            _settings = _gs()
+            _host = _settings.HOST_IP if hasattr(_settings, "HOST_IP") else "服务器IP"
+            raise Exception(f"触发了抖音安全验证（验证码），请打开 noVNC 手动完成验证: http://{_host}:26080 ，完成后重新发起搜索")
+
+        # 等待搜索结果加载 - 优先等待特定的搜索结果选择器
         selectors_to_try = [
-            'a[href*="/video/"]',
-            'a[href*="/note/"]',
             'li[data-e2e="search-common-video"]',
             'li[data-e2e="search-common-note"]',
+            '[class*="SearchVideoCard"]',
             '[class*="VideoCard"]',
             '[class*="NoteCard"]',
             '[class*="search-result"]',
+            'a[href*="/video/"]',
+            'a[href*="/note/"]',
         ]
         
         found = False
@@ -569,11 +590,19 @@ class DouyinCrawler:
                 continue
         
         if not found:
+            # 未找到搜索结果，再检查一次验证码
+            has_captcha2 = await self._check_captcha()
+            if has_captcha2:
+                await self._save_debug_screenshot("captcha_after_wait")
+                logger.error("等待搜索结果时检测到验证码！")
+                from config import get_settings as _gs2
+                _settings2 = _gs2()
+                _host2 = _settings2.HOST_IP if hasattr(_settings2, "HOST_IP") else "服务器IP"
+                raise Exception(f"触发了抖音安全验证（验证码），请打开 noVNC 手动完成验证: http://{_host2}:26080 ，完成后重新发起搜索")
             logger.warning("未检测到搜索结果，尝试滚动加载...")
             try:
                 await self._page.evaluate("window.scrollBy(0, 500)")
                 await asyncio.sleep(2)
-                # 再次尝试
                 for selector in selectors_to_try:
                     try:
                         await self._page.wait_for_selector(selector, timeout=3000)
@@ -586,12 +615,10 @@ class DouyinCrawler:
         
         await asyncio.sleep(2)
         
-        # 排序已通过URL参数实现，无需额外操作
-        
         if is_cancelled():
             logger.info("任务已取消")
             return []
-        
+
         need_login = await self._check_login_required()
         if need_login:
             logger.warning("检测到登录弹窗，请手动登录后重试")
@@ -689,7 +716,7 @@ class DouyinCrawler:
                     else:
                         logger.warning(f"详情页提取失败: {link['video_id']}")
                     
-                    await asyncio.sleep(2 + (detail_visits % 3))
+                    await asyncio.sleep(random.uniform(2.0, 5.0) + (detail_visits % 3))
                     
                 except Exception as e:
                     logger.error(f"访问详情页失败: {link['video_id']}, {e}")
@@ -701,15 +728,79 @@ class DouyinCrawler:
             
             if len(qualified_videos) < limit and detail_visits < max_detail_visits:
                 logger.info(f"当前符合条件 {len(qualified_videos)}/{limit}，滚动加载更多...")
+                if scroll_count % 3 == 0:
+                    if await self._check_captcha():
+                        await self._save_debug_screenshot("captcha_in_scroll")
+                        raise Exception(f"滚动过程中触发了抖音安全验证（验证码），请打开 noVNC 手动完成验证: http://101.43.94.39:26080 ，完成后重新发起搜索")
                 report_progress("collecting", len(visited_ids), detail_visits, len(qualified_videos), f"滚动加载更多... 已找到 {len(qualified_videos)} 个")
                 await self._page.evaluate("window.scrollBy(0, 800)")
-                await asyncio.sleep(2)
+                await asyncio.sleep(random.uniform(1.5, 3.5))
                 scroll_count += 1
         
         logger.info(f"搜索完成: 访问 {detail_visits} 个详情页，找到 {len(qualified_videos)} 个符合条件的视频")
         report_progress("completed", len(visited_ids), detail_visits, len(qualified_videos), f"搜索完成，找到 {len(qualified_videos)} 个符合条件的内容")
         return qualified_videos
     
+
+    async def _check_captcha(self) -> bool:
+        """独立检测抖音图形验证码（支持 iframe 方式）"""
+        try:
+            # 方法1: 检查页面 title 或 URL 是否含验证码特征
+            page_title = await self._page.title()
+            page_url = self._page.url
+            if '验证码' in page_title or 'verifycenter' in page_url or 'captcha' in page_url.lower():
+                logger.warning(f"验证码检测: title='{page_title}', url={page_url[:60]}")
+                return True
+
+            # 方法2: 检查页面是否有 iframe 指向 bytedance 验证中心
+            has_captcha_iframe = await self._page.evaluate("""
+                () => {
+                    const iframes = document.querySelectorAll('iframe');
+                    for (const iframe of iframes) {
+                        const src = iframe.src || '';
+                        if (src.includes('verifycenter') || src.includes('captcha') ||
+                            src.includes('bytedance') || src.includes('zijieapi')) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            if has_captcha_iframe:
+                logger.warning("验证码检测: 发现验证码 iframe")
+                return True
+
+            # 方法3: 检查主页面文字（降级兜底）
+            body_text = await self._page.evaluate("() => document.body?.innerText || ''")
+            captcha_keywords = [
+                '点击两个形状相同', '点击最大', '请完成安全验证',
+                '拖动滑块', '按住左边按钮拖动', '请完成下列验证',
+                '完成拼图', '滑动完成验证', '人机验证',
+                '请按住滑块', '验证后继续',
+            ]
+            if any(k in body_text for k in captcha_keywords):
+                logger.warning("验证码检测: 发现验证码文字")
+                return True
+
+            # 方法4: 检查上下文中其他页面（如弹出的验证页）
+            try:
+                all_pages = self._page.context.pages
+                for p in all_pages:
+                    if p == self._page:
+                        continue
+                    p_url = p.url
+                    p_title = await p.title()
+                    if 'verifycenter' in p_url or '验证码' in p_title or 'captcha' in p_url.lower():
+                        logger.warning(f"验证码检测: 其他页面 title='{p_title}' url={p_url[:60]}")
+                        return True
+            except Exception:
+                pass
+
+            return False
+        except Exception as e:
+            logger.warning(f"检测验证码失败: {e}")
+            return False
+
     async def _check_login_required(self) -> bool:
         """检查页面是否需要登录"""
         try:
@@ -894,7 +985,7 @@ class DouyinCrawler:
         finally:
             session.close()
     
-    async def save_to_db(self, videos: List, keyword: str, platform: str, min_likes: int = 0):
+    async def save_to_db(self, videos: List, keyword: str, platform: str, min_likes: int = 0, skip_likes_filter: bool = False):
         """批量保存视频到数据库"""
         from crawler.models import get_platform_session, DouyinVideoRecord, XiaohongshuVideoRecord, ShipinhaoVideoRecord
         import json
@@ -948,6 +1039,8 @@ class DouyinCrawler:
                         existing.shares = video_info.shares
                     if hasattr(video_info, 'thumbnail_url'):
                         existing.thumbnail_url = video_info.thumbnail_url
+                        if video_info.duration and video_info.duration > 0:
+                            existing.duration = video_info.duration
                     logger.debug(f"更新视频记录: {video_info.video_id}")
                 else:
                     # 创建新记录
@@ -965,6 +1058,7 @@ class DouyinCrawler:
                         collects=getattr(video_info, 'collects', 0),
                         shares=getattr(video_info, 'shares', 0),
                         thumbnail_url=getattr(video_info, 'thumbnail_url', ''),
+                        duration=getattr(video_info, 'duration', 0.0),
                         keyword=keyword,
                     )
                     session.add(record)
@@ -1011,6 +1105,11 @@ class DouyinCrawler:
             }
         """)
         
+        cnt = len(links_data or [])
+        if cnt == 0:
+            logger.warning("搜索页未提取到任何链接，可能页面未正确加载")
+        else:
+            logger.info(f"从搜索页提取到 {cnt} 个链接")
         return links_data or []
     
     async def _extract_search_results_v2(self) -> List[VideoInfo]:
@@ -1346,9 +1445,34 @@ class DouyinCrawler:
         def is_cancelled() -> bool:
             return cancel_check() if cancel_check else False
         
+        # ── Step 1: 从任意文本中提取第一个抖音相关链接 ──
+        url_match = re.search(r'https?://[^\s一-鿿　-〿，。！？、""''【】《》]+', video_url)
+        if url_match:
+            extracted = url_match.group(0).rstrip('/').rstrip(',:;')
+            if extracted != video_url:
+                logger.info(f"从文本中提取链接: {extracted}")
+            video_url = extracted
+
+        # ── Step 2: 短链接（v.douyin.com）跟随重定向 ──
+        if "v.douyin.com" in video_url:
+            logger.info(f"检测到短链接，正在解析重定向: {video_url}")
+            try:
+                parsed = await DouyinCrawler.parse_share_url(video_url)
+                if parsed.get("video_url"):
+                    video_url = parsed["video_url"]
+                    logger.info(f"短链接解析完成: {video_url}")
+            except Exception as _e:
+                logger.warning(f"短链接解析失败，使用原始URL: {_e}")
+
         video_id = self._extract_video_id_from_url(video_url)
         logger.info(f"获取视频详情: {video_id} (超时: {timeout}s)")
-        
+
+        # 非标准 URL（精选页、分享页、搜索页等）统一转换为标准视频详情页
+        if video_id and f"/video/{video_id}" not in video_url:
+            normalized_url = f"https://www.douyin.com/video/{video_id}"
+            logger.info(f"URL 规范化: {video_url[:80]} -> {normalized_url}")
+            video_url = normalized_url
+
         # 存储取消检查函数，供内部方法使用
         self._current_cancel_check = is_cancelled
         
@@ -1496,7 +1620,8 @@ class DouyinCrawler:
             screenshot_path = await self._save_video_screenshot(video_id)
             logger.info(f"截图保存完成: {screenshot_path}")
             
-            return VideoInfo(
+            # 构建 VideoInfo（与关键词搜索保持一致，后续提取缩略图和时长）
+            video_info = VideoInfo(
                 video_id=video_id,
                 video_url=video_url,
                 author_name=basic_data.get('author_name', ''),
@@ -1517,7 +1642,14 @@ class DouyinCrawler:
                 is_video=is_video,
                 images=images,
             )
-        
+            # 下载视频提取缩略图和时长（与关键词搜索保持一致）
+            if is_video and video_stream_url:
+                try:
+                    await self._download_and_extract_thumbnail(video_info)
+                    logger.info(f"缩略图: {video_info.thumbnail_url}, 时长: {video_info.duration:.2f}s")
+                except Exception as thumb_e:
+                    logger.warning(f"缩略图/时长提取失败（不影响主流程）: {thumb_e}")
+            return video_info
         except Exception as e:
             logger.error(f"获取视频详情失败: {e}")
             raise
