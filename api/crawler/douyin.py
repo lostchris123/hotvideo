@@ -1215,114 +1215,118 @@ class DouyinCrawler:
             return None
 
     async def _extract_with_selector_v1(self) -> List[VideoInfo]:
-        """选择器策略1: 通用视频卡片"""
+        """选择器策略1: 从搜索结果列表提取 - 使用 data-e2e 属性"""
         video_data = await self._page.evaluate("""
             () => {
                 const results = [];
-                
-                // 查找所有可能的视频卡片 - 更新选择器列表
-                const selectors = [
-                    'li[data-e2e="search-common-video"]',
-                    '[data-e2e="search-common-video"]',
-                    '[class*="SearchVideoCard"]',
-                    '[class*="VideoCard"]',
-                    '[class*="video-card"]',
-                    '[class*="search-result"] li',
-                    'ul[class*="video"] > li',
-                    'div[class*="video-item"]',
-                    'a[href*="/video/"], a[href*="/note/"]',
-                ];
-                
-                let cards = [];
-                for (const sel of selectors) {
-                    try {
-                        const found = document.querySelectorAll(sel);
-                        if (found.length > cards.length) {
-                            cards = found;
-                        }
-                    } catch (e) {}
+                const seen = new Set();
+
+                function parseCount(str) {
+                    if (!str) return 0;
+                    str = String(str).trim();
+                    const match = str.match(/([\d.]+)\s*([万亿]?)/);
+                    if (!match) return 0;
+                    const num = parseFloat(match[1]);
+                    const unit = match[2];
+                    if (unit === '万') return Math.floor(num * 10000);
+                    if (unit === '亿') return Math.floor(num * 100000000);
+                    return Math.floor(num) || 0;
                 }
-                
-                // 如果没有找到卡片，尝试直接找视频链接
-                if (cards.length === 0) {
-                    const links = document.querySelectorAll('a[href*="/video/"], a[href*="/note/"]');
-                    links.forEach(link => {
-                        const url = link.href;
-                        let contentId = "";
-                    const videoMatch = url.match(/video\\/(\\d+)/);
-                    const noteMatch = url.match(/note\\/(\\d+)/);
-                    if (videoMatch) contentId = videoMatch[1];
-                    else if (noteMatch) contentId = noteMatch[1];
-                        if (videoId) {
-                            results.push({
-                                video_id: contentId,
-                                video_url: url,
-                                description: '',
-                                author_name: '',
-                                likes: 0,
-                                comments: 0,
-                                shares: 0,
-                                collects: 0,
-                            });
+
+                // 方法1: 从 scroll-list 提取（搜索结果页）
+                const scrollList = document.querySelector('[data-e2e="scroll-list"]');
+                if (scrollList) {
+                    const items = scrollList.querySelectorAll('li');
+                    for (const item of items) {
+                        const text = item.innerText?.trim();
+                        if (!text || text.length < 20) continue;
+
+                        // 从链接中提取视频ID
+                        let videoId = null;
+                        const links = item.querySelectorAll('a');
+                        for (const link of links) {
+                            const href = decodeURIComponent(link.href);
+                            const match = href.match(/search_result_id["\s:=]+(\d{10,})/);
+                            if (match) {
+                                videoId = match[1];
+                                break;
+                            }
                         }
-                    });
-                    return results;
+
+                        if (!videoId || seen.has(videoId)) continue;
+                        seen.add(videoId);
+
+                        // 提取统计数据
+                        const statsMatch = text.match(/(\d+\.?\d*[万亿]?)\s*(\d+)\s*(\d+\.?\d*[万亿]?)\s*(\d+\.?\d*[万亿]?)/);
+
+                        // 提取作者名称
+                        const authorLink = item.querySelector('a[href*="/user/"]');
+                        const authorName = authorLink ? authorLink.textContent.trim() : '';
+
+                        // 提取描述
+                        const descParts = text.split('\n').filter(t => t.length > 10 && !t.match(/^[\d.]+[万亿]?$/));
+                        const description = descParts.find(t => t.length > 20) || '';
+
+                        let likes = 0, comments = 0, collects = 0, shares = 0;
+                        if (statsMatch) {
+                            likes = parseCount(statsMatch[1]);
+                            comments = parseInt(statsMatch[2]) || 0;
+                            collects = parseCount(statsMatch[3]);
+                            shares = parseCount(statsMatch[4]);
+                        }
+
+                        results.push({
+                            video_id: videoId,
+                            video_url: `https://www.douyin.com/video/${videoId}`,
+                            description: description.substring(0, 200),
+                            author_name: authorName,
+                            likes: likes,
+                            comments: comments,
+                            collects: collects,
+                            shares: shares,
+                        });
+                    }
                 }
-                
-                cards.forEach(card => {
-                    try {
-                        // 视频链接
+
+                // 方法2: 旧版搜索结果卡片
+                if (results.length === 0) {
+                    const cards = document.querySelectorAll('[data-e2e="search-common-video"], [class*="SearchVideoCard"], [class*="VideoCard"]');
+                    for (const card of cards) {
                         const link = card.querySelector('a[href*="/video/"], a[href*="/note/"]');
-                        if (!link) return;
-                        
+                        if (!link) continue;
+
                         const url = link.href;
-                        let contentId = "";
-                    const videoMatch = url.match(/video\\/(\\d+)/);
-                    const noteMatch = url.match(/note\\/(\\d+)/);
-                    if (videoMatch) contentId = videoMatch[1];
-                    else if (noteMatch) contentId = noteMatch[1];
-                        if (!videoId) return;
-                        
-                        // 描述
+                        const videoMatch = url.match(/video\/(\d+)/);
+                        const noteMatch = url.match(/note\/(\d+)/);
+                        const contentId = videoMatch ? videoMatch[1] : (noteMatch ? noteMatch[1] : '');
+                        if (!contentId || seen.has(contentId)) continue;
+                        seen.add(contentId);
+
                         const descEl = card.querySelector('[class*="title"], [class*="desc"], h3, h4, p');
                         const description = descEl ? descEl.textContent.trim() : '';
-                        
-                        // 作者
+
                         const authorEl = card.querySelector('[class*="author"], [class*="name"], [class*="nickname"]');
                         const authorName = authorEl ? authorEl.textContent.trim() : '';
-                        
-                        // 统计
-                        const stats = card.querySelectorAll('[class*="count"], [class*="stats"] span');
-                        let likes = 0, comments = 0;
-                        if (stats.length >= 1) likes = parseCount(stats[0].textContent);
-                        if (stats.length >= 2) comments = parseCount(stats[1].textContent);
-                        
+
                         results.push({
                             video_id: contentId,
                             video_url: url,
                             description: description,
                             author_name: authorName,
-                            likes: likes,
-                            comments: comments,
+                            likes: 0,
+                            comments: 0,
                             shares: 0,
                             collects: 0,
                         });
-                    } catch (e) {}
-                });
-                
-                function parseCount(str) {
-                    str = str.trim();
-                    if (str.includes('万')) return Math.floor(parseFloat(str) * 10000);
-                    if (str.includes('亿')) return Math.floor(parseFloat(str) * 100000000);
-                    return parseInt(str.replace(/[^0-9]/g, '')) || 0;
+                    }
                 }
-                
+
                 return results;
             }
         """)
-        
+
         return [VideoInfo(**item) for item in video_data]
-    
+
     async def _extract_with_selector_v2(self) -> List[VideoInfo]:
         """选择器策略2: 从所有链接提取"""
         video_data = await self._page.evaluate("""
