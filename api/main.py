@@ -3993,6 +3993,14 @@ async def visual_analyze_viral_video(
         logger.info(f"视频 {video_id} 通过爆款阈值检查: 分数={viral_score:.0f}")
         # === 阈值检查结束 ===
 
+        # === 文案检查 ===
+        if not record.transcript or not record.transcript.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="请先提取视频文案后再进行爆款分析。请点击\"提取文案\"按钮完成文案提取。"
+            )
+        # === 文案检查结束 ===
+
         # 已有结果且不强制重新分析
         if not force and record.viral_points:
             logger.info(f"返回已有视觉分析结果: {video_id}")
@@ -4006,7 +4014,7 @@ async def visual_analyze_viral_video(
                     "visual_description": record.visual_description or "",
                     "scene_types": json.loads(record.scene_types) if record.scene_types else [],
                     "visual_highlights": json.loads(record.visual_highlights) if record.visual_highlights else [],
-                    "cinematography": record.cinematography or "",
+                    "cinematography": getattr(record, "cinematography", None) or "",
                 } if record.visual_description else None,
                 "viral_points": json.loads(record.viral_points) if record.viral_points else [],
                 "visual_hooks": json.loads(record.visual_hooks) if record.visual_hooks else [],
@@ -4055,7 +4063,7 @@ async def visual_analyze_viral_video(
             record.visual_description = vr.get("visual_description", "")
             record.scene_types = json.dumps(vr.get("scene_types", []), ensure_ascii=False)
             record.visual_highlights = json.dumps(vr.get("visual_highlights", []), ensure_ascii=False)
-            record.cinematography = vr.get("cinematography", "")
+            if hasattr(record, "cinematography"): record.cinematography = vr.get("cinematography", "")
         record.viral_points = json.dumps(result.get("viral_points", []), ensure_ascii=False)
         record.visual_hooks = json.dumps(result.get("visual_hooks", []), ensure_ascii=False)
         record.content_hooks = json.dumps(result.get("content_hooks", []), ensure_ascii=False)
