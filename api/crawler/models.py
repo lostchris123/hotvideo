@@ -163,6 +163,20 @@ class BaseVideoRecord(Base):
     interaction_analysis = Column(Text, comment="互动分析(JSON)")
     improvement_suggestions = Column(Text, comment="改进建议(JSON)")
     success_formula = Column(Text, comment="成功公式")
+
+    # 视觉增强分析结果（新版）
+    visual_description = Column(Text, comment="AI视觉描述")
+    scene_types = Column(Text, comment="场景类型(JSON)")
+    visual_highlights = Column(Text, comment="视觉亮点(JSON)")
+    viral_points = Column(Text, comment="爆点列表(JSON)")
+    visual_hooks = Column(Text, comment="视觉钩子(JSON)")
+    content_hooks = Column(Text, comment="内容钩子(JSON)")
+    emotion_triggers = Column(Text, comment="情绪触发点(JSON)")
+    target_audience = Column(Text, comment="目标受众")
+    creation_prompt = Column(Text, comment="创作提示词")
+    replication_tips = Column(Text, comment="复刻建议(JSON)")
+    frames_analyzed = Column(Integer, comment="分析帧数")
+    frame_timestamps = Column(Text, comment="截帧时间戳列表(JSON)")
     
     # 元数据
     keyword = Column(String(100), comment="搜索关键词")

@@ -100,6 +100,12 @@ class XiaohongshuVideoInfo:
             )
 
 
+async def _random_sleep(min_sec: float = 1.0, max_sec: float = 3.0):
+    """随机延迟辅助函数"""
+    import random
+    await asyncio.sleep(random.uniform(min_sec, max_sec))
+
+
 class XiaohongshuCrawler:
     """小红书爬虫"""
     
@@ -894,7 +900,7 @@ class XiaohongshuCrawler:
             logger.info(f"滚动加载更多 [{scroll_count}/{max_scrolls}]...")
             report_progress("collecting", len(all_links), 0, 0, f"正在收集链接... 已收集 {len(all_links)} 条")
             await self._page.evaluate("window.scrollBy(0, 1000)")
-            await asyncio.sleep(3 + (scroll_count % 3))
+            await asyncio.sleep(random.uniform(2.0, 5.0) + (scroll_count % 2))
         
         logger.info(f"第一阶段完成，共收集 {len(all_links)} 条链接")
         
@@ -1039,7 +1045,7 @@ class XiaohongshuCrawler:
                 else:
                     logger.warning(f"详情页提取失败: {link['video_id']}")
                 
-                await asyncio.sleep(8 + (detail_visits % 5) + random.randint(0, 3))
+                await asyncio.sleep(random.uniform(6.0, 12.0) + (detail_visits % 3))
                 
             except Exception as e:
                 if "反爬机制" in str(e):

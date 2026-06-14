@@ -4,6 +4,7 @@ Playwright 浏览器管理模块 - 支持持久化登录状态和跨进程复用
 """
 from __future__ import annotations
 import asyncio
+import os
 import subprocess
 import signal
 import platform as sys_platform
@@ -84,6 +85,9 @@ class BrowserManager:
         else:
             self.user_data_dir = str(settings.get_browser_profile_dir(platform, user_id))
         
+        # DISPLAY 配置（非 headless 模式）
+        self.display = os.environ.get('DISPLAY', '')
+
         # 确保目录存在
         Path(self.user_data_dir).mkdir(parents=True, exist_ok=True)
         
@@ -205,6 +209,11 @@ class BrowserManager:
             self._playwright = await async_playwright().start()
         
         # 浏览器启动参数
+        # CDP 调试端口（让 noVNC 能看到这个浏览器窗口）
+        # VNC offset: cdp_port - 9222 -> novnc port = 26080 + offset
+        vnc_offset = self.cdp_port - 9222
+        logger.info(f"[{self.platform}] CDP端口={self.cdp_port}, noVNC观察端口=http://<host>:{26080 + vnc_offset}")
+
         launch_args = [
             "--no-sandbox",
             "--disable-dev-shm-usage",
@@ -216,6 +225,7 @@ class BrowserManager:
 
             "--start-maximized",
             "--force-device-scale-factor=1",
+            f"--remote-debugging-port={self.cdp_port}",
         ]
 
         if self.proxy:
@@ -257,17 +267,57 @@ class BrowserManager:
             os.environ["DISPLAY"] = self.display or os.environ.get("DISPLAY", ":99")
             logger.info(f"[{self.platform}] 设置 DISPLAY={os.environ['DISPLAY']}")
         
-        self._context = await self._playwright.chromium.launch_persistent_context(**launch_options)
-        await self._context.set_viewport_size({
-            "width": 1280,
-            "height": 720
-        })
+        # 用 subprocess 启动 chromium（带 CDP 端口），这样进程独立存活，可被下次任务复用
+        import subprocess as _sp, socket as _sock, httpx as _httpx
+        display = os.environ.get("DISPLAY", ":99")
+
+        # 先检查端口是否已有 chromium，有则直接跳过启动
+        _cs = _sock.socket()
+        _cs.settimeout(1)
+        _port_in_use = _cs.connect_ex(('localhost', self.cdp_port)) == 0
+        _cs.close()
+
+        if not _port_in_use:
+            cmd = [
+                launch_options.get("executable_path", "chromium"),
+                f"--remote-debugging-port={self.cdp_port}",
+                f"--user-data-dir={self.user_data_dir}",
+                "--no-first-run", "--no-sandbox", "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage", "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-extensions",
+                "--window-position=0,0", "--window-size=1280,720",
+                "--force-device-scale-factor=1", "--high-dpi-support=1",
+            ]
+            env = os.environ.copy()
+            env["DISPLAY"] = display
+            _sp.Popen(cmd, env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+            logger.info(f"[{self.platform}] chromium 进程已启动 (CDP:{self.cdp_port}, DISPLAY={display})")
+
+            # 等待 chromium CDP 就绪（只在新启动时等）
+            for _i in range(20):
+                await asyncio.sleep(0.5)
+                try:
+                    async with _httpx.AsyncClient() as _c:
+                        _r = await _c.get(f"http://localhost:{self.cdp_port}/json/version", timeout=2)
+                        if _r.status_code == 200:
+                            logger.info(f"[{self.platform}] CDP 就绪 (尝试 {_i+1} 次)")
+                            break
+                except Exception:
+                    continue
+            else:
+                logger.warning(f"[{self.platform}] CDP 等待超时，继续尝试连接")
+        else:
+            logger.info(f"[{self.platform}] CDP:{self.cdp_port} 已有浏览器在运行，跳过启动直接连接")
+        
+        # 通过 CDP 连接
+        browser = await self._playwright.chromium.connect_over_cdp(f"http://localhost:{self.cdp_port}")
+        self._context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        self._browser = browser
 
         # 注入反检测脚本
         await self._inject_stealth()
-        
-        self._browser = self._context.browser
-        
+
         logger.info(f"[{self.platform}] 浏览器启动成功（CDP端口: {self.cdp_port}，用户数据: {self.user_data_dir}）")
         return self._browser
     
@@ -284,7 +334,6 @@ class BrowserManager:
         else:
             self._page = await self._context.new_page()
             logger.info(f"[{self.platform}] 创建新页面")
-        self._page = await self._context.new_page()    
         # 关键：强制 viewport
         await self._page.set_viewport_size({
             "width": 1280,
@@ -300,22 +349,100 @@ class BrowserManager:
         return await self.new_page()
     
     async def _inject_stealth(self):
-        """注入反检测脚本"""
+        """注入完整反检测脚本（覆盖主流自动化检测点）"""
         if not self._context:
             return
-        
+
         await self._context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
+        (() => {
+            // 1. 隐藏 webdriver 标记
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+            // 2. 伪造 plugins（空 plugins 是自动化特征）
+            const fakePlugins = [
+                { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+                { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
+            ];
             Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5]
+                get: () => Object.assign(fakePlugins, { item: (i) => fakePlugins[i], namedItem: (n) => fakePlugins.find(p => p.name === n), refresh: () => {} }),
             });
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['zh-CN', 'zh', 'en']
+
+            // 3. 语言
+            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
+
+            // 4. window.chrome 对象（Headless 下缺失）
+            if (!window.chrome) {
+                window.chrome = {
+                    app: { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } },
+                    runtime: { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {} },
+                    loadTimes: () => ({}),
+                    csi: () => ({}),
+                };
+            }
+
+            // 5. permissions API（自动化环境 query 行为异常）
+            const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+            if (originalQuery) {
+                window.navigator.permissions.query = (parameters) =>
+                    parameters.name === 'notifications'
+                        ? Promise.resolve({ state: Notification.permission })
+                        : originalQuery(parameters);
+            }
+
+            // 6. platform
+            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+
+            // 7. hardwareConcurrency（模拟 8 核）
+            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+
+            // 8. deviceMemory
+            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+
+            // 9. 隐藏 Headless 相关 UA 特征
+            Object.defineProperty(navigator, 'appVersion', {
+                get: () => navigator.userAgent.replace('Headless', ''),
             });
+
+            // 10. WebGL 厂商/渲染器伪装
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                if (parameter === 37445) return 'Intel Inc.';
+                if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+                return getParameter.call(this, parameter);
+            };
+
+            // 11. iframe 内也注入（防止 iframe 检测）
+            const _origCreateElement = document.createElement.bind(document);
+            document.createElement = function(tag, ...args) {
+                const el = _origCreateElement(tag, ...args);
+                if (tag.toLowerCase() === 'iframe') {
+                    el.addEventListener('load', () => {
+                        try {
+                            if (el.contentWindow && el.contentWindow.navigator) {
+                                Object.defineProperty(el.contentWindow.navigator, 'webdriver', { get: () => undefined });
+                            }
+                        } catch(e) {}
+                    });
+                }
+                return el;
+            };
+
+            // 12. 修复 toString 防止检测被覆盖
+            const _nativeToString = Function.prototype.toString;
+            Function.prototype.toString = function() {
+                if (this === Function.prototype.toString) return _nativeToString.call(this);
+                return _nativeToString.call(this);
+            };
+        })();
         """)
     
+    async def random_sleep(self, min_sec: float = 1.0, max_sec: float = 3.0):
+        """随机延迟，模拟人工操作节奏"""
+        import asyncio, random
+        delay = random.uniform(min_sec, max_sec)
+        await asyncio.sleep(delay)
+
     async def close(self):
         """关闭浏览器（不保留状态）"""
         if self._page and not self._page.is_closed():

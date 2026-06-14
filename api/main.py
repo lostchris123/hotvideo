@@ -18,7 +18,7 @@ import asyncio
 import json
 
 from config import get_settings
-from crawler.models import init_all_platforms, get_platform_session, PLATFORM_MODELS, Template, DeletedVideoRecord, CreditTransaction
+from crawler.models import init_all_platforms, get_platform_session, PLATFORM_MODELS, Template, DeletedVideoRecord, CreditTransaction, DouyinVideoRecord, XiaohongshuVideoRecord, ShipinhaoVideoRecord
 from datetime import datetime
 from crawler.douyin import DouyinCrawler
 from crawler.xiaohongshu import XiaohongshuCrawler
@@ -3946,10 +3946,15 @@ async def visual_analyze_viral_video(
     video_id: str,
     platform: str = "douyin",
     force: bool = False,
-    num_frames: int = 3,
+    num_frames: int = 8,
+    strategy: str = "smart",
     current_user: User = Depends(get_current_user)
 ):
-    """视觉增强型爆款分析：截帧+视觉模型+文案 → 爆点+创作提示词"""
+    """视觉增强型爆款分析：截帧+视觉模型+文案 → 爆点+创作提示词
+
+参数：
+- num_frames: 截帧数量（默认8帧，最多15帧）
+- strategy: 截帧策略 - smart(智能分布) / random(随机)"""
     require_license()
 
     session = get_platform_session(platform)
@@ -3996,6 +4001,7 @@ async def visual_analyze_viral_video(
                 "cached": True,
                 "has_video": record.frames_analyzed is not None and record.frames_analyzed > 0,
                 "frames_analyzed": record.frames_analyzed or 0,
+                "frame_timestamps": json.loads(record.frame_timestamps) if record.frame_timestamps else [],
                 "visual_result": {
                     "visual_description": record.visual_description or "",
                     "scene_types": json.loads(record.scene_types) if record.scene_types else [],
@@ -4040,6 +4046,7 @@ async def visual_analyze_viral_video(
             fans_count=str(record.fans_count or "0"),
             platform=platform,
             num_frames=num_frames,
+            strategy=strategy,
         )
 
         # 保存到数据库
@@ -4057,6 +4064,8 @@ async def visual_analyze_viral_video(
         record.creation_prompt = result.get("creation_prompt", "")
         record.replication_tips = json.dumps(result.get("replication_tips", []), ensure_ascii=False)
         record.frames_analyzed = result.get("frames_analyzed", 0)
+        if result.get("frame_timestamps"):
+            record.frame_timestamps = json.dumps(result.get("frame_timestamps", []), ensure_ascii=False)
         session.commit()
         logger.info(f"视觉分析结果已保存: {video_id}")
 
@@ -4471,6 +4480,11 @@ async def get_shipinhao_download_url(
         return _shipinhao_download_urls[video_id]
 
     raise HTTPException(status_code=404, detail="下载链接不存在")
+
+# ============ 多类型提示词生成接口 ============
+from main_prompts import register_prompt_routes
+app = register_prompt_routes(app, User, get_current_user, DouyinVideoRecord, XiaohongshuVideoRecord, ShipinhaoVideoRecord, json, logger)
+
 @app.get("/{path:path}")
 async def serve_spa(path: str):
     """SPA fallback - 所有非API路由返回index.html"""
@@ -4611,3 +4625,407 @@ async def public_transcript(
     except Exception as e:
         logger.error(f"提取文案失败: {e}")
         return {"success": False, "error": str(e)}
+
+# 导入提示词相关模块
+from analyzer.prompt_generator import PromptGenerator
+from crawler.models_prompts import VideoPrompt, PROMPT_TYPES
+from fastapi import HTTPException, Depends
+from typing import List, Dict, Optional
+import json
+
+
+# 初始化提示词生成器
+prompt_generator = PromptGenerator()
+
+
+@app.post("/api/videos/{video_id}/generate-prompts")
+async def generate_prompts(
+    video_id: str,
+    platform: str = "douyin",  # 支持: douyin, xiaohongshu, shipinhao
+    # db session will be obtained inside function
+    current_user: User = Depends(get_current_user)
+):
+    """为视频生成多类型提示词"""
+    
+    # 根据平台选择模型
+    if platform == "douyin":
+        VideoRecord = DouyinVideoRecord
+    elif platform == "xiaohongshu":
+        VideoRecord = XiaohongshuVideoRecord
+    elif platform == "shipinhao":
+        VideoRecord = ShipinhaoVideoRecord
+    else:
+        raise HTTPException(status_code=400, detail=f"不支持的平台: {platform}")
+    
+    # 查询视频记录
+    video = db.query(VideoRecord).filter(VideoRecord.video_id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="视频不存在")
+    
+    # 检查是否有视觉分析结果
+    if not video.visual_description:
+        raise HTTPException(status_code=400, detail="请先进行视觉分析")
+    
+    try:
+        # 解析JSON字段
+        viral_points = json.loads(video.viral_points) if video.viral_points else []
+        visual_hooks = json.loads(video.visual_hooks) if video.visual_hooks else []
+        content_hooks = json.loads(video.content_hooks) if video.content_hooks else []
+        
+        # 生成所有类型的提示词
+        prompts = prompt_generator.generate_all_prompts(
+            visual_description=video.visual_description,
+            viral_points=viral_points,
+            visual_hooks=visual_hooks,
+            content_hooks=content_hooks,
+            target_audience=video.target_audience or "普通用户",
+            transcript=video.transcript,
+            duration=video.duration
+        )
+        
+        # 保存到数据库
+        saved_prompts = []
+        for prompt_type, prompt_content in prompts.items():
+            if prompt_content:  # 只保存非空内容
+                # 检查是否已存在相同版本
+                existing = db.query(VideoPrompt).filter(
+                    VideoPrompt.video_id == video_id,
+                    VideoPrompt.platform == platform,
+                    VideoPrompt.prompt_type == prompt_type,
+                    VideoPrompt.version == 1
+                ).first()
+                
+                if existing:
+                    # 更新现有记录
+                    existing.prompt_content = prompt_content
+                    existing.is_edited = False
+                    existing.original_content = prompt_content
+                else:
+                    # 创建新记录
+                    prompt_record = VideoPrompt(
+                        video_id=video_id,
+                        platform=platform,
+                        prompt_type=prompt_type,
+                        prompt_content=prompt_content,
+                        version=1,
+                        is_edited=False,
+                        original_content=prompt_content
+                    )
+                    db.add(prompt_record)
+                
+                saved_prompts.append({
+                    "type": prompt_type,
+                    "type_name": PROMPT_TYPES.get(prompt_type, prompt_type),
+                    "content": prompt_content,
+                    "version": 1,
+                    "is_edited": False
+                })
+        
+        db.commit()
+        
+        return {
+            "success": True,
+            "message": "提示词生成成功",
+            "prompts": saved_prompts,
+            "video_id": video_id,
+            "platform": platform
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"生成提示词失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"生成提示词失败: {str(e)}")
+
+
+@app.get("/api/videos/{video_id}/prompts")
+async def get_prompts(
+    video_id: str,
+    platform: str = "douyin",
+    prompt_type: Optional[str] = None,
+    # db session will be obtained inside function
+    current_user: User = Depends(get_current_user)
+):
+    """获取视频的提示词列表"""
+    
+    query = db.query(VideoPrompt).filter(
+        VideoPrompt.video_id == video_id,
+        VideoPrompt.platform == platform
+    )
+    
+    if prompt_type:
+        query = query.filter(VideoPrompt.prompt_type == prompt_type)
+    
+    prompts = query.order_by(VideoPrompt.prompt_type, VideoPrompt.version.desc()).all()
+    
+    return {
+        "success": True,
+        "prompts": [prompt.to_dict() for prompt in prompts],
+        "total": len(prompts)
+    }
+
+
+@app.get("/api/videos/{video_id}/prompts/{prompt_type}/latest")
+async def get_latest_prompt(
+    video_id: str,
+    prompt_type: str,
+    platform: str = "douyin",
+    # db session will be obtained inside function
+    current_user: User = Depends(get_current_user)
+):
+    """获取指定类型的最新提示词"""
+    
+    prompt = db.query(VideoPrompt).filter(
+        VideoPrompt.video_id == video_id,
+        VideoPrompt.platform == platform,
+        VideoPrompt.prompt_type == prompt_type
+    ).order_by(VideoPrompt.version.desc()).first()
+    
+    if not prompt:
+        raise HTTPException(status_code=404, detail="该类型的提示词不存在")
+    
+    return {
+        "success": True,
+        "prompt": prompt.to_dict()
+    }
+
+
+@app.post("/api/videos/{video_id}/prompts/{prompt_type}/regenerate")
+async def regenerate_prompt(
+    video_id: str,
+    prompt_type: str,
+    platform: str = "douyin",
+    # db session will be obtained inside function
+    current_user: User = Depends(get_current_user)
+):
+    """重新生成指定类型的提示词"""
+    
+    # 验证提示词类型
+    if prompt_type not in PROMPT_TYPES:
+        raise HTTPException(status_code=400, detail=f"不支持的提示词类型: {prompt_type}")
+    
+    # 根据平台选择模型
+    if platform == "douyin":
+        VideoRecord = DouyinVideoRecord
+    elif platform == "xiaohongshu":
+        VideoRecord = XiaohongshuVideoRecord
+    elif platform == "shipinhao":
+        VideoRecord = ShipinhaoVideoRecord
+    else:
+        raise HTTPException(status_code=400, detail=f"不支持的平台: {platform}")
+    
+    # 查询视频记录
+    video = db.query(VideoRecord).filter(VideoRecord.video_id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="视频不存在")
+    
+    if not video.visual_description:
+        raise HTTPException(status_code=400, detail="请先进行视觉分析")
+    
+    try:
+        # 解析JSON字段
+        viral_points = json.loads(video.viral_points) if video.viral_points else []
+        visual_hooks = json.loads(video.visual_hooks) if video.visual_hooks else []
+        content_hooks = json.loads(video.content_hooks) if video.content_hooks else []
+        
+        # 重新生成提示词
+        new_content = prompt_generator.regenerate_prompt(
+            prompt_type=prompt_type,
+            visual_description=video.visual_description,
+            viral_points=viral_points,
+            visual_hooks=visual_hooks,
+            content_hooks=content_hooks,
+            target_audience=video.target_audience or "普通用户",
+            transcript=video.transcript,
+            duration=video.duration
+        )
+        
+        if not new_content:
+            raise HTTPException(status_code=500, detail="提示词生成失败")
+        
+        # 查找最新版本
+        latest = db.query(VideoPrompt).filter(
+            VideoPrompt.video_id == video_id,
+            VideoPrompt.platform == platform,
+            VideoPrompt.prompt_type == prompt_type
+        ).order_by(VideoPrompt.version.desc()).first()
+        
+        new_version = latest.version + 1 if latest else 1
+        
+        # 保存新版本
+        prompt_record = VideoPrompt(
+            video_id=video_id,
+            platform=platform,
+            prompt_type=prompt_type,
+            prompt_content=new_content,
+            version=new_version,
+            is_edited=False,
+            original_content=new_content
+        )
+        db.add(prompt_record)
+        db.commit()
+        
+        return {
+            "success": True,
+            "message": "提示词重新生成成功",
+            "prompt": prompt_record.to_dict()
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"重新生成提示词失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"重新生成提示词失败: {str(e)}")
+
+
+@app.put("/api/videos/{video_id}/prompts/{prompt_type}/edit")
+async def edit_prompt(
+    video_id: str,
+    prompt_type: str,
+    request: dict,
+    platform: str = "douyin",
+    # db session will be obtained inside function
+    current_user: User = Depends(get_current_user)
+):
+    """编辑指定类型的提示词"""
+    
+    new_content = request.get("content")
+    if not new_content:
+        raise HTTPException(status_code=400, detail="请提供提示词内容")
+    
+    # 查找最新版本
+    prompt = db.query(VideoPrompt).filter(
+        VideoPrompt.video_id == video_id,
+        VideoPrompt.platform == platform,
+        VideoPrompt.prompt_type == prompt_type
+    ).order_by(VideoPrompt.version.desc()).first()
+    
+    if not prompt:
+        raise HTTPException(status_code=404, detail="该类型的提示词不存在")
+    
+    try:
+        # 保存编辑后的内容
+        edited_prompt = VideoPrompt(
+            video_id=video_id,
+            platform=platform,
+            prompt_type=prompt_type,
+            prompt_content=new_content,
+            version=prompt.version + 1,
+            is_edited=True,
+            original_content=prompt.original_content or prompt.prompt_content
+        )
+        db.add(edited_prompt)
+        db.commit()
+        
+        return {
+            "success": True,
+            "message": "提示词编辑成功",
+            "prompt": edited_prompt.to_dict()
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"编辑提示词失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"编辑提示词失败: {str(e)}")
+
+
+@app.get("/api/videos/{video_id}/prompts/{prompt_type}/versions")
+async def get_prompt_versions(
+    video_id: str,
+    prompt_type: str,
+    platform: str = "douyin",
+    # db session will be obtained inside function
+    current_user: User = Depends(get_current_user)
+):
+    """获取提示词的所有版本"""
+    
+    prompts = db.query(VideoPrompt).filter(
+        VideoPrompt.video_id == video_id,
+        VideoPrompt.platform == platform,
+        VideoPrompt.prompt_type == prompt_type
+    ).order_by(VideoPrompt.version.desc()).all()
+    
+    return {
+        "success": True,
+        "prompt_type": prompt_type,
+        "type_name": PROMPT_TYPES.get(prompt_type, prompt_type),
+        "versions": [prompt.to_dict() for prompt in prompts],
+        "total": len(prompts)
+    }
+
+
+@app.get("/api/videos/{video_id}/prompts/types")
+async def get_prompt_types(
+    video_id: str,
+    platform: str = "douyin",
+    # db session will be obtained inside function
+    current_user: User = Depends(get_current_user)
+):
+    """获取视频已有的提示词类型"""
+    
+    types = db.query(VideoPrompt.prompt_type).filter(
+        VideoPrompt.video_id == video_id,
+        VideoPrompt.platform == platform
+    ).distinct().all()
+    
+    type_list = [t[0] for t in types]
+    
+    return {
+        "success": True,
+        "available_types": type_list,
+        "type_names": {t: PROMPT_TYPES.get(t, t) for t in type_list}
+    }
+
+
+@app.delete("/api/videos/{video_id}/prompts/{prompt_type}/version/{version}")
+async def delete_prompt_version(
+    video_id: str,
+    prompt_type: str,
+    version: int,
+    platform: str = "douyin",
+    # db session will be obtained inside function
+    current_user: User = Depends(get_current_user)
+):
+    """删除指定版本的提示词"""
+    
+    prompt = db.query(VideoPrompt).filter(
+        VideoPrompt.video_id == video_id,
+        VideoPrompt.platform == platform,
+        VideoPrompt.prompt_type == prompt_type,
+        VideoPrompt.version == version
+    ).first()
+    
+    if not prompt:
+        raise HTTPException(status_code=404, detail="提示词版本不存在")
+    
+    try:
+        db.delete(prompt)
+        db.commit()
+        
+        return {
+            "success": True,
+            "message": "提示词版本删除成功"
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"删除提示词版本失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"删除提示词版本失败: {str(e)}")
+
+
+@app.get("/api/prompt-types")
+async def get_all_prompt_types():
+    """获取所有支持的提示词类型"""
+    return {
+        "success": True,
+        "prompt_types": PROMPT_TYPES
+    }
+
+
+# 添加数据库会话依赖函数
+def get_db():
+    """获取数据库会话"""
+    from crawler.models import get_user_session
+    db = get_user_session()
+    try:
+        yield db
+    finally:
+        db.close()

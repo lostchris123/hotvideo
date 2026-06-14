@@ -1,6 +1,8 @@
 """
-视觉增强型爆款分析模块（v10）
-- 修复 JSON 格式问题：模型返回字典格式需要更智能的转换
+视觉增强型爆款分析模块（v11）
+- 修改：增加截帧数量支持（默认8帧，最多15帧）
+- 优化：智能截帧策略（开头+中间+结尾均匀分布）
+- 改进：返回截帧时间戳和预览图
 """
 from __future__ import annotations
 import os
@@ -11,7 +13,7 @@ import subprocess
 import tempfile
 import re
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict
 from dataclasses import dataclass
 from loguru import logger
 import httpx
@@ -109,9 +111,32 @@ def _extract_json(text: str) -> dict:
     return None
 
 
-def extract_frames(video_path: str, num_frames: int = 3) -> List[str]:
+def extract_frames(
+    video_path: str, 
+    num_frames: int = 8,
+    strategy: str = "smart"
+) -> Dict:
+    """
+    从视频中截取多帧画面
+    
+    Args:
+        video_path: 视频文件路径
+        num_frames: 截帧数量（默认8帧，最多15帧）
+        strategy: 截帧策略 - "smart"(智能分布) / "random"(随机)
+    
+    Returns:
+        {
+            "frames": [base64编码的图片],
+            "timestamps": [截帧时间点列表],
+            "duration": 视频总时长
+        }
+    """
     if not os.path.exists(video_path):
-        return []
+        return {"frames": [], "timestamps": [], "duration": 0}
+    
+    # 限制最大帧数（避免API token超限）
+    num_frames = min(max(num_frames, 1), 15)
+    
     try:
         probe_cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", video_path]
         probe_data = json.loads(subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10).stdout)
@@ -119,31 +144,82 @@ def extract_frames(video_path: str, num_frames: int = 3) -> List[str]:
     except:
         duration = 60.0
 
+    # 计算安全时间范围（跳过开头和结尾的黑屏/片尾）
     margin = duration * 0.1
     safe_start, safe_end = margin, duration - margin
     if safe_end <= safe_start:
         safe_start, safe_end = 0, duration
 
-    timestamps = sorted(random.sample(
-        [safe_start + (safe_end - safe_start) * i / (num_frames + 1) for i in range(1, num_frames + 1)], k=min(num_frames, 3)
-    ))
-    timestamps = [max(0, min(duration - 1, t + random.uniform(-duration * 0.05, duration * 0.05))) for t in timestamps]
+    # 根据策略生成时间戳
+    if strategy == "smart":
+        # 智能截帧：开头(2帧) + 中间(主要) + 结尾(2帧)
+        timestamps = []
+        
+        # 开头部分：前10%范围内取2帧
+        opening_end = duration * 0.15
+        timestamps.extend([
+            duration * 0.03,  # 第1秒左右
+            duration * 0.08   # 开场后
+        ])
+        
+        # 中间部分：均匀分布
+        middle_frames = num_frames - 4  # 除去开头和结尾
+        if middle_frames > 0:
+            middle_start = duration * 0.15
+            middle_end = duration * 0.85
+            step = (middle_end - middle_start) / (middle_frames + 1)
+            timestamps.extend([middle_start + step * i for i in range(1, middle_frames + 1)])
+        
+        # 结尾部分：最后15%范围内取2帧
+        timestamps.extend([
+            duration * 0.88,
+            duration * 0.95
+        ])
+        
+        # 调整到安全范围内
+        timestamps = [max(0, min(duration - 1, t)) for t in timestamps[:num_frames]]
+        
+    else:
+        # 随机截帧：在安全范围内随机分布
+        timestamps = sorted(random.sample(
+            [safe_start + (safe_end - safe_start) * i / (num_frames + 1) 
+             for i in range(1, num_frames + 1)], 
+            k=num_frames
+        ))
+        timestamps = [max(0, min(duration - 1, t + random.uniform(-duration * 0.05, duration * 0.05))) 
+                     for t in timestamps]
 
     frames_b64 = []
     with tempfile.TemporaryDirectory() as tmpdir:
         for i, ts in enumerate(timestamps):
             out_path = os.path.join(tmpdir, f"frame_{i}.jpg")
             try:
-                subprocess.run(["ffmpeg", "-ss", str(ts), "-i", video_path, "-vframes", "1", "-q:v", "3", "-vf", "scale=720:-1", out_path, "-y", "-loglevel", "quiet"], timeout=15, capture_output=True)
+                subprocess.run([
+                    "ffmpeg", "-ss", str(ts), "-i", video_path, 
+                    "-vframes", "1", "-q:v", "3", 
+                    "-vf", "scale=720:-1", 
+                    out_path, "-y", "-loglevel", "quiet"
+                ], timeout=15, capture_output=True)
+                
                 if os.path.exists(out_path):
                     with open(out_path, "rb") as f:
                         frames_b64.append(base64.b64encode(f.read()).decode())
-            except:
-                pass
-    return frames_b64
+            except Exception as e:
+                logger.warning(f"截帧失败 (ts={ts:.2f}s): {e}")
+    
+    return {
+        "frames": frames_b64,
+        "timestamps": timestamps[:len(frames_b64)],
+        "duration": duration
+    }
 
 
-def analyze_frames_with_vision(frames_b64: List[str], api_key: str, base_url: str = "https://open.bigmodel.cn/api/paas/v4", model: str = "GLM-4.1V-Thinking-Flash") -> Optional[VisualAnalysisResult]:
+def analyze_frames_with_vision(
+    frames_b64: List[str], 
+    api_key: str, 
+    base_url: str = "https://open.bigmodel.cn/api/paas/v4", 
+    model: str = "GLM-4.1V-Thinking-Flash"
+) -> Optional[VisualAnalysisResult]:
     if not frames_b64:
         return None
 
@@ -168,10 +244,10 @@ def analyze_frames_with_vision(frames_b64: List[str], api_key: str, base_url: st
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
 
     try:
-        with httpx.Client(timeout=60) as client:
+        with httpx.Client(timeout=90) as client:
             resp = client.post(f"{base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": model, "messages": [{"role": "user", "content": content}], "temperature": 0.3, "max_tokens": 1000})
+                json={"model": model, "messages": [{"role": "user", "content": content}], "temperature": 0.3, "max_tokens": 1500})
             
             resp_json = resp.json()
             if "choices" not in resp_json:
@@ -375,7 +451,22 @@ class VisualViralAnalyzer:
         self.text_model = text_model
         self.videos_dir = Path(videos_dir)
 
-    def analyze(self, video_id: str, title: str, transcript: str, likes: int, comments: int, shares: int, collects: int, author_name: str, fans_count: str, platform: str, num_frames: int = 3) -> dict:
+    def analyze(
+        self, 
+        video_id: str, 
+        title: str, 
+        transcript: str, 
+        likes: int, 
+        comments: int, 
+        shares: int, 
+        collects: int, 
+        author_name: str, 
+        fans_count: str, 
+        platform: str, 
+        num_frames: int = 8,
+        strategy: str = "smart"
+    ) -> dict:
+        # 查找视频文件
         video_path = None
         for ext in [".mp4", ".mov", ".webm"]:
             candidate = self.videos_dir / f"{video_id}{ext}"
@@ -383,13 +474,28 @@ class VisualViralAnalyzer:
                 video_path = str(candidate)
                 break
 
-        frames_b64 = extract_frames(video_path, num_frames) if video_path else []
-        visual_result = analyze_frames_with_vision(frames_b64, self.api_key, self.base_url, self.vision_model) if frames_b64 else None
-        insight = generate_viral_insight(visual_result, title, transcript, likes, comments, shares, collects, author_name, fans_count, platform, self.api_key, self.base_url, self.text_model)
+        # 截取帧
+        frame_data = extract_frames(video_path, num_frames, strategy) if video_path else {"frames": [], "timestamps": [], "duration": 0}
+        frames_b64 = frame_data["frames"]
+        
+        # 视觉分析
+        visual_result = analyze_frames_with_vision(
+            frames_b64, self.api_key, self.base_url, self.vision_model
+        ) if frames_b64 else None
+        
+        # 爆款洞察
+        insight = generate_viral_insight(
+            visual_result, title, transcript, likes, comments, shares, collects, 
+            author_name, fans_count, platform, 
+            self.api_key, self.base_url, self.text_model
+        )
 
         return {
             "has_video": video_path is not None,
             "frames_analyzed": len(frames_b64),
+            "frame_timestamps": frame_data.get("timestamps", []),
+            "video_duration": frame_data.get("duration", 0),
+            "frame_previews": frames_b64,  # 新增：返回base64预览图
             "visual_result": {
                 "visual_description": visual_result.visual_description,
                 "scene_types": visual_result.scene_types,

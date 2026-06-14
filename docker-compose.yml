@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   db:
     image: postgres:16
@@ -5,17 +7,20 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: hotvideo
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-hotvideo123}
+      POSTGRES_PASSWORD: Hotvideo123!
       POSTGRES_DB: hotvideo
+      PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "25432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U hotvideo"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - hotvideo-net
 
   redis:
     image: redis:7-alpine
@@ -25,7 +30,14 @@ services:
     volumes:
       - ./data/redis:/data
     ports:
-      - "6379:6379"
+      - "26379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hotvideo-net
 
   api:
     build: ./api
@@ -36,24 +48,22 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    ports:
-      - "25050:25050"
     environment:
-      - DATABASE_URL=postgresql+asyncpg://hotvideo:${DB_PASSWORD:-hotvideo123}@db:5432/hotvideo
+      - DATABASE_URL=postgresql+asyncpg://hotvideo:Hotvideo123!@db:5432/hotvideo
       - REDIS_URL=redis://redis:6379/0
       - HEADLESS=false
       - MAX_BROWSER_INSTANCES=5
-      - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
-      - HOST_IP=${HOST_IP:-localhost}
+      - SECRET_KEY=hotvideo-secret-key-change-in-production
+      - HOST_IP=101.43.94.39
       - VNC_PORT_OFFSET=20000
       - ASR_ENGINE=siliconflow
-      - SILICONFLOW_API_KEY=${SILICONFLOW_API_KEY}
+      - SILICONFLOW_API_KEY=sk-fbmjkfnzenpyatpycmhisqhkmoxeoipspchkjtquhfqxqmhp
       - SILICONFLOW_MODEL=FunAudioLLM/SenseVoiceSmall
       - SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1/audio/transcriptions
       - SILICONFLOW_TIMEOUT=120
-      - ZHIPU_API_KEY=${ZHIPU_API_KEY}
-      - ZHIPU_BASE_URL=${ZHIPU_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
-      - ZHIPU_MODEL=${ZHIPU_MODEL:-GLM-4.1V-Thinking-Flash}
+      - ZHIPU_API_KEY=e113890c9efa4086842e68348de3550d.E4L8UZtjjPVpngHA
+      - ZHIPU_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+      - ZHIPU_MODEL=GLM-4.1V-Thinking-Flash
     volumes:
       - ./data/browser_profiles:/app/data/browser_profiles
       - ./data/videos:/app/data/videos
@@ -63,9 +73,51 @@ services:
       - ./logs:/app/logs
       - ./api/asr:/app/asr
       - ./api/config:/app/config
-    env_file:
-      - ./api/.env
+      - ./api/.env:/app/.env
+    ports:
+      - "25050:8000"
+      - "25900-25910:5900-5910"
+      - "26080-26090:6080-6090"
+    command: >
+      bash -lc "set -e;
+      pkill -f websockify 2>/dev/null || true;
+      pkill -f x11vnc 2>/dev/null || true;
+      pkill -f 'Xvfb :99' 2>/dev/null || true;
+      rm -rf /app/data/browser_profiles/*/Singleton* /tmp/.X*-lock /tmp/.X11-unix/X99 2>/dev/null || true;
+      Xvfb :99 -screen 0 1920x1080x24 -ac &
+      for i in $(seq 1 20); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.5; done;
+      [ -S /tmp/.X11-unix/X99 ] || { echo 'Xvfb failed to create display :99'; exit 1; };
+      export DISPLAY=:99;
+      x11vnc -display :99 -rfbport 5900 -forever -shared -nopw -localhost -o /tmp/x11vnc.log &
+      for i in $(seq 1 20); do python -c 'import socket; s=socket.socket(); s.settimeout(0.2); s.connect((\"127.0.0.1\",5900)); s.close()' && break || sleep 0.5; done;
+      python -c 'import socket; s=socket.socket(); s.settimeout(0.5); s.connect((\"127.0.0.1\",5900)); s.close()' || { echo 'x11vnc failed'; cat /tmp/x11vnc.log || true; exit 1; };
+      websockify --web=/usr/share/novnc 6080 localhost:5900 &
+      for i in $(seq 1 20); do python -c 'import socket; s=socket.socket(); s.settimeout(0.2); s.connect((\"127.0.0.1\",6080)); s.close()' && break || sleep 0.5; done;
+      python -c 'import socket; s=socket.socket(); s.settimeout(0.5); s.connect((\"127.0.0.1\",6080)); s.close()' || { echo 'websockify failed'; exit 1; };
+      exec python main.py server --host 0.0.0.0 --port 8000"
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+    networks:
+      - hotvideo-net
 
-volumes:
-  postgres_data:
-  redis_data:
+  web:
+    image: nginx:alpine
+    container_name: hotvideo-web
+    restart: unless-stopped
+    depends_on:
+      - api
+    volumes:
+      - ./web:/usr/share/nginx/html:ro
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    ports:
+      - "25080:80"
+      - "25443:443"
+    networks:
+      - hotvideo-net
+
+networks:
+  hotvideo-net:
+    driver: bridge

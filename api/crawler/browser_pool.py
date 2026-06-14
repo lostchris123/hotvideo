@@ -19,7 +19,7 @@ class BrowserPool:
             cls._instance = super().__new__(cls)
         return cls._instance
     
-    def __init__(self, max_instances: int = 5, idle_timeout_minutes: int = 10, memory_threshold: float = 0.8):
+    def __init__(self, max_instances: int = 5, idle_timeout_minutes: int = 60, memory_threshold: float = 0.8):
         if BrowserPool._initialized:
             return
         BrowserPool._initialized = True
@@ -150,6 +150,6 @@ class BrowserPool:
 
 browser_pool = BrowserPool(
     max_instances=10,
-    idle_timeout_minutes=10,
+    idle_timeout_minutes=60,
     memory_threshold=0.9
 )

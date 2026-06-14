@@ -106,77 +106,57 @@ class VNCSessionManager:
                 # 会话不在运行状态，销毁重建
                 await self.destroy_session(user_id)
         
-        vnc_display = self._get_available_vnc_display()
-        
-        used_vnc_ports = [s.get("vnc_port") for s in self._sessions.values()]
-        used_ws_ports = [s.get("websockify_port") for s in self._sessions.values()]
-        
-        # VNC 端口 = 5900 + display
-        vnc_port = self._vnc_base_port + vnc_display
-        # 检查端口是否被占用
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            sock.bind(('localhost', vnc_port))
-            sock.close()
-        except OSError:
-            # 端口被占用，尝试其他 display
-            vnc_port = self._get_available_port(self._vnc_base_port, used_vnc_ports)
-            vnc_display = vnc_port - self._vnc_base_port
-        websockify_port = self._get_available_port(self._websockify_base_port, used_ws_ports)
-        
-        password = str(random.randint(1000, 9999))
+        # ── 统一复用容器内置的 VNC/websockify（:99 + 5900 + 6080）──
+        # 不再为每个会话单独启动 Xvfb/vncserver/websockify
+        from config import get_settings as _gs
+        _settings = _gs()
+        cdp_port = _settings.get_user_cdp_port(user_id, platform)
+        # 外部 VNC 端口 = 容器内 6080 + 端口偏移（20000）= 26080
+        external_ws_port = 6080 + self._port_offset
+
         session_id = f"{user_id}_{platform}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        
         session_dir = self._sessions_dir / str(user_id)
         session_dir.mkdir(parents=True, exist_ok=True)
-        
+
         session_info = {
             "session_id": session_id,
             "user_id": user_id,
             "platform": platform,
-            "display": vnc_display,
-            "vnc_port": vnc_port,
-            "websockify_port": websockify_port,
-            "password": password,
+            "display": 99,
+            "display_env": ":99",
+            "vnc_port": 5900,
+            "websockify_port": 6080,
+            "cdp_port": cdp_port,
+            "password": "",
             "resolution": resolution,
             "status": "starting",
             "created_at": datetime.now(),
             "processes": {},
             "session_dir": str(session_dir)
         }
-        
+
         try:
-            if os.name != 'nt':
-                # Xvnc 自带显示服务器，不需要 Xvfb
-                await self._start_xvfb(session_info)
-                await self._start_vnc_server(session_info)
-            else:
-                logger.warning("Windows系统暂不支持完整VNC功能，使用简化模式")
-            
-            await self._start_websockify(session_info)
-            
+            # 只启动浏览器（内部有复用检查，已有则跳过）
             await self._start_browser(session_info)
-            
+
             session_info["status"] = "running"
-            # 使用外部端口（容器端口 + 偏移量）
-            external_ws_port = websockify_port + self._port_offset
-            session_info["vnc_url"] = f"http://{self._host_ip}:{external_ws_port}/vnc.html"
-            session_info["vnc_password"] = password
+            session_info["vnc_url"] = f"http://{self._host_ip}:{external_ws_port}/vnc.html?autoconnect=true&resize=scale"
+            session_info["vnc_password"] = ""
             self._sessions[user_id] = session_info
-            
-            logger.info(f"VNC会话创建成功: user={user_id}, vnc_port={vnc_port}, ws_port={websockify_port}")
-            
+
+            logger.info(f"会话创建成功: user={user_id}, cdp={cdp_port}, vnc=http://{self._host_ip}:{external_ws_port}")
+
             return {
                 "session_id": session_id,
-                "vnc_port": vnc_port,
-                "websockify_port": websockify_port,
-                "password": password,
+                "vnc_port": 5900,
+                "websockify_port": 6080,
+                "password": "",
                 "status": "running",
                 "message": "会话创建成功"
             }
-            
+
         except Exception as e:
-            logger.error(f"创建VNC会话失败: {e}")
+            logger.error(f"创建会话失败: {e}")
             await self._cleanup_session(session_info)
             raise
 
@@ -326,7 +306,18 @@ class VNCSessionManager:
         browser_profile.mkdir(parents=True, exist_ok=True)
         
         cdp_port = settings.get_user_cdp_port(user_id, platform)
-        
+
+        # ── 先检查该 CDP 端口是否已有 chromium 在跑，有则直接复用 ──
+        import socket as _sock
+        _s = _sock.socket()
+        _s.settimeout(1)
+        _already_running = _s.connect_ex(('localhost', cdp_port)) == 0
+        _s.close()
+        if _already_running:
+            session_info["cdp_port"] = cdp_port
+            logger.info(f"[session] CDP:{cdp_port} 已有浏览器在运行，直接复用，跳过启动")
+            return
+
         # 清理浏览器 profile 脏数据（防止抖音等平台黑屏）
         try:
             cleanup_items = [
@@ -899,8 +890,16 @@ class SimpleSessionManager:
             logger.info(f"已清理用户 {user_id} 的浏览器子进程")
         except Exception as e:
             logger.warning(f"pkill 清理失败: {e}")
-        
-        # 3. 清理 Singleton 锁文件
+
+        # 3. 清理 browser_pool 里的旧实例，避免下次搜索复用死亡的 browser 对象
+        try:
+            from crawler.browser_pool import browser_pool
+            await browser_pool.unregister(user_id, session_info.get("platform", "douyin"))
+            logger.info(f"已清理 browser_pool 中用户 {user_id} 的实例")
+        except Exception as e:
+            logger.warning(f"browser_pool 清理失败: {e}")
+
+        # 4. 清理 Singleton 锁文件
         try:
             subprocess.run(["rm", "-rf", f"/app/data/browser_profiles/user_{user_id}/*/Singleton*"],
                           capture_output=True, timeout=5)
@@ -1222,7 +1221,7 @@ class UnifiedSessionManager:
             # 使用外部端口（容器端口 + 偏移量）
             port_offset = int(os.environ.get("VNC_PORT_OFFSET", "20000"))
             external_ws_port = result['websockify_port'] + port_offset
-            vnc_url = f"http://{self._host_ip}:{external_ws_port}/vnc.html"
+            vnc_url = f"http://{self._host_ip}:{external_ws_port}/vnc.html?autoconnect=true&resize=scale"
             return {
                 "mode": "vnc",
                 "session_id": result["session_id"],
