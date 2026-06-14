@@ -6,16 +6,16 @@ services:
     container_name: hotvideo-db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: hotvideo
-      POSTGRES_PASSWORD: Hotvideo123!
-      POSTGRES_DB: hotvideo
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
     ports:
       - "25432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U hotvideo"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -49,21 +49,21 @@ services:
       redis:
         condition: service_healthy
     environment:
-      - DATABASE_URL=postgresql+asyncpg://hotvideo:Hotvideo123!@db:5432/hotvideo
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       - REDIS_URL=redis://redis:6379/0
       - HEADLESS=false
       - MAX_BROWSER_INSTANCES=5
-      - SECRET_KEY=hotvideo-secret-key-change-in-production
-      - HOST_IP=101.43.94.39
+      - SECRET_KEY=${SECRET_KEY}
+      - HOST_IP=${HOST_IP}
       - VNC_PORT_OFFSET=20000
       - ASR_ENGINE=siliconflow
-      - SILICONFLOW_API_KEY=sk-fbmjkfnzenpyatpycmhisqhkmoxeoipspchkjtquhfqxqmhp
-      - SILICONFLOW_MODEL=FunAudioLLM/SenseVoiceSmall
-      - SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1/audio/transcriptions
-      - SILICONFLOW_TIMEOUT=120
-      - ZHIPU_API_KEY=e113890c9efa4086842e68348de3550d.E4L8UZtjjPVpngHA
-      - ZHIPU_BASE_URL=https://open.bigmodel.cn/api/paas/v4
-      - ZHIPU_MODEL=GLM-4.1V-Thinking-Flash
+      - SILICONFLOW_API_KEY=${SILICONFLOW_API_KEY}
+      - SILICONFLOW_MODEL=${SILICONFLOW_MODEL}
+      - SILICONFLOW_BASE_URL=${SILICONFLOW_BASE_URL}
+      - SILICONFLOW_TIMEOUT=${SILICONFLOW_TIMEOUT}
+      - ZHIPU_API_KEY=${ZHIPU_API_KEY}
+      - ZHIPU_BASE_URL=${ZHIPU_BASE_URL}
+      - ZHIPU_MODEL=${ZHIPU_MODEL}
     volumes:
       - ./data/browser_profiles:/app/data/browser_profiles
       - ./data/videos:/app/data/videos
@@ -85,14 +85,14 @@ services:
       pkill -f 'Xvfb :99' 2>/dev/null || true;
       rm -rf /app/data/browser_profiles/*/Singleton* /tmp/.X*-lock /tmp/.X11-unix/X99 2>/dev/null || true;
       Xvfb :99 -screen 0 1920x1080x24 -ac &
-      for i in $(seq 1 20); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.5; done;
+      for i in \$(seq 1 20); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.5; done;
       [ -S /tmp/.X11-unix/X99 ] || { echo 'Xvfb failed to create display :99'; exit 1; };
       export DISPLAY=:99;
       x11vnc -display :99 -rfbport 5900 -forever -shared -nopw -localhost -o /tmp/x11vnc.log &
-      for i in $(seq 1 20); do python -c 'import socket; s=socket.socket(); s.settimeout(0.2); s.connect((\"127.0.0.1\",5900)); s.close()' && break || sleep 0.5; done;
+      for i in \$(seq 1 20); do python -c 'import socket; s=socket.socket(); s.settimeout(0.2); s.connect((\"127.0.0.1\",5900)); s.close()' && break || sleep 0.5; done;
       python -c 'import socket; s=socket.socket(); s.settimeout(0.5); s.connect((\"127.0.0.1\",5900)); s.close()' || { echo 'x11vnc failed'; cat /tmp/x11vnc.log || true; exit 1; };
       websockify --web=/usr/share/novnc 6080 localhost:5900 &
-      for i in $(seq 1 20); do python -c 'import socket; s=socket.socket(); s.settimeout(0.2); s.connect((\"127.0.0.1\",6080)); s.close()' && break || sleep 0.5; done;
+      for i in \$(seq 1 20); do python -c 'import socket; s=socket.socket(); s.settimeout(0.2); s.connect((\"127.0.0.1\",6080)); s.close()' && break || sleep 0.5; done;
       python -c 'import socket; s=socket.socket(); s.settimeout(0.5); s.connect((\"127.0.0.1\",6080)); s.close()' || { echo 'websockify failed'; exit 1; };
       exec python main.py server --host 0.0.0.0 --port 8000"
     deploy:
