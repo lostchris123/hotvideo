@@ -1677,122 +1677,108 @@ class DouyinCrawler:
             return False
     
     async def _extract_basic_info(self, video_id: str) -> dict:
-        """快速提取基础信息（点赞、评论、作者等）"""
+        """快速提取基础信息（点赞、评论、作者等）- 使用 data-e2e 属性"""
         try:
             data = await self._page.evaluate("""
                 () => {
                     const result = {};
-                    
+
                     function parseCount(str) {
                         if (!str) return 0;
                         str = String(str).trim();
-                        const match = str.match(/[\\d.]+/);
+                        const match = str.match(/([\d.]+)\s*([万亿]?)/);
                         if (!match) return 0;
-                        const num = parseFloat(match[0]);
-                        if (str.includes('万')) return Math.floor(num * 10000);
-                        if (str.includes('亿')) return Math.floor(num * 100000000);
+                        const num = parseFloat(match[1]);
+                        const unit = match[2];
+                        if (unit === '万') return Math.floor(num * 10000);
+                        if (unit === '亿') return Math.floor(num * 100000000);
                         return Math.floor(num) || 0;
                     }
-                    
+
+                    // 使用 data-e2e 属性提取数字
+                    function getTextFromDataE2e(selector) {
+                        const el = document.querySelector(selector);
+                        if (!el) return null;
+                        const spans = el.querySelectorAll('span');
+                        for (const span of spans) {
+                            const text = span.textContent.trim();
+                            if (/^[\d.]+[万亿]?$/.test(text)) {
+                                return text;
+                            }
+                        }
+                        const text = el.innerText;
+                        const match = text.match(/([\d.]+[万亿]?)/);
+                        return match ? match[1] : null;
+                    }
+
+                    // 提取点赞、评论、收藏、分享
+                    const diggText = getTextFromDataE2e('[data-e2e="video-player-digg"]');
+                    const commentText = getTextFromDataE2e('[data-e2e="feed-comment-icon"]');
+                    const collectText = getTextFromDataE2e('[data-e2e="video-player-collect"]');
+                    const shareText = getTextFromDataE2e('[data-e2e="video-player-share"]');
+
+                    if (diggText) result.likes = parseCount(diggText);
+                    if (commentText) result.comments = parseCount(commentText);
+                    if (collectText) result.collects = parseCount(collectText);
+                    if (shareText) result.shares = parseCount(shareText);
+
+                    // 如果 data-e2e 没有获取到，尝试旧方法
+                    if (!result.likes) {
+                        const interactContainer = document.querySelector('[class*="fN2jqmuV"]');
+                        if (interactContainer) {
+                            const numSpans = interactContainer.querySelectorAll('[class*="oYTywyxr"], [class*="Vc7Hm_bN"]');
+                            const nums = [];
+                            numSpans.forEach(el => {
+                                const text = el.textContent.trim();
+                                if (text && /^[\d.]+[万亿]?$/.test(text)) {
+                                    nums.push(text);
+                                }
+                            });
+                            if (nums.length >= 4) {
+                                result.likes = parseCount(nums[0]);
+                                result.comments = parseCount(nums[1]);
+                                result.collects = parseCount(nums[2]);
+                                result.shares = parseCount(nums[3]);
+                            }
+                        }
+                    }
+
+                    // 提取描述
                     const title = document.title;
                     let rawDesc = '';
                     if (title && title.includes(' - 抖音')) {
                         rawDesc = title.replace(' - 抖音', '').trim();
                     }
-                    
-                    const tagMatches = rawDesc.match(/#[^#\\s]+/g) || [];
+
+                    const descEl = document.querySelector('[data-e2e="detail-video-info"]');
+                    if (descEl) {
+                        rawDesc = descEl.innerText.trim();
+                    }
+
+                    const tagMatches = rawDesc.match(/#[^#\s]+/g) || [];
                     result.tags = tagMatches.map(t => t.trim());
-                    result.description = rawDesc.replace(/#[^#\\s]+/g, '').replace(/\\s+/g, ' ').trim();
-                    
-                    const interactContainer = document.querySelector('[class*="fN2jqmuV"]');
-                    
-                    if (interactContainer) {
-                        const numSpans = interactContainer.querySelectorAll('[class*="oYTywyxr"], [class*="Vc7Hm_bN"]');
-                        const nums = [];
-                        numSpans.forEach(el => {
-                            const text = el.textContent.trim();
-                            if (text && /^[\\d.]+[万亿]?$/.test(text)) {
-                                nums.push(text);
-                            }
-                        });
-                        
-                        if (nums.length >= 4) {
-                            result.likes = parseCount(nums[0]);
-                            result.comments = parseCount(nums[1]);
-                            result.collects = parseCount(nums[2]);
-                            result.shares = parseCount(nums[3]);
-                        } else {
-                            const allNumDivs = interactContainer.querySelectorAll('div, span');
-                            const allNums = [];
-                            allNumDivs.forEach(el => {
-                                const text = el.textContent.trim();
-                                if (/^[\\d.]+[万亿]?$/.test(text) && text.length < 10 && !allNums.includes(text)) {
-                                    allNums.push(text);
-                                }
-                            });
-                            result.likes = parseCount(allNums[0]);
-                            result.comments = parseCount(allNums[1]);
-                            result.collects = parseCount(allNums[2]);
-                            result.shares = parseCount(allNums[3]);
-                        }
-                    }
-                    
-                    if (!result.likes) {
-                        const allNums = [];
-                        document.querySelectorAll('div, span').forEach(el => {
-                            const text = el.textContent.trim();
-                            if (/^[\\d.]+[万亿]?$/.test(text) && text.length < 10) {
-                                const parent = el.parentElement;
-                                if (parent && parent.className && (
-                                    parent.className.includes('fN2jqmuV') ||
-                                    parent.className.includes('zqe4B9aR')
-                                )) {
-                                    if (!allNums.includes(text)) allNums.push(text);
-                                }
-                            }
-                        });
-                        result.likes = parseCount(allNums[0]);
-                        result.comments = parseCount(allNums[1]);
-                        result.collects = parseCount(allNums[2]);
-                        result.shares = parseCount(allNums[3]);
-                    }
-                    
-                    const allFollowBtns = document.querySelectorAll('button');
-                    let videoFollowBtn = null;
-                    
-                    for (const btn of allFollowBtns) {
-                        const text = btn.textContent.trim();
-                        if (text === '关注') {
-                            const parent = btn.closest('[class*="userMenuPanel"], [class*="tab-user"]');
-                            if (!parent) {
-                                videoFollowBtn = btn;
-                                break;
+                    result.description = rawDesc.replace(/#[^#\s]+/g, '').replace(/\s+/g, ' ').trim();
+
+                    // 提取作者信息 - 使用 data-e2e
+                    const userInfoEl = document.querySelector('[data-e2e="user-info"]');
+                    if (userInfoEl) {
+                        // 提取粉丝数和获赞数
+                        const fansMatch = userInfoEl.innerText.match(/粉丝([\d.]+[万亿]?)/);
+                        const likedMatch = userInfoEl.innerText.match(/获赞([\d.]+[万亿]?)/);
+                        if (fansMatch) result.fans_count = fansMatch[1];
+                        if (likedMatch) result.liked_count = likedMatch[1];
+
+                        // 提取作者名称（第一个span元素）
+                        const authorEl = userInfoEl.querySelector('span');
+                        if (authorEl) {
+                            const nameText = authorEl.textContent.trim();
+                            if (nameText && nameText.length < 30 && !nameText.match(/^[\d.]+/)) {
+                                result.author_name = nameText;
                             }
                         }
                     }
-                    
-                    if (videoFollowBtn) {
-                        let container = videoFollowBtn.parentElement;
-                        for (let i = 0; i < 5 && container; i++) {
-                            const links = container.querySelectorAll('a[href*="/user/"]');
-                            for (const link of links) {
-                                if (link.className.includes('tab-user') || link.closest('[class*="userMenuPanel"]')) {
-                                    continue;
-                                }
-                                const span = link.querySelector('span');
-                                if (span) {
-                                    const text = span.textContent.trim();
-                                    if (text && text.length < 30 && text !== '关注' && text !== '我的' && !text.match(/^[\\d.]+/)) {
-                                        result.author_name = text;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (result.author_name) break;
-                            container = container.parentElement;
-                        }
-                    }
-                    
+
+                    // 如果 user-info 没有获取到作者，尝试旧方法
                     if (!result.author_name) {
                         const userLinks = document.querySelectorAll('a[href*="/user/"]');
                         for (const link of userLinks) {
@@ -1802,35 +1788,51 @@ class DouyinCrawler:
                             const span = link.querySelector('span');
                             if (span) {
                                 const text = span.textContent.trim();
-                                if (text && text.length < 30 && text !== '我的' && !text.match(/^[\\d.]+/)) {
+                                if (text && text.length < 30 && text !== '我的' && !text.match(/^[\d.]+/)) {
                                     result.author_name = text;
                                     break;
                                 }
                             }
                         }
                     }
-                    
+
+                    // 提取作者ID
                     const authorLink = document.querySelector('a[href*="/user/"]');
                     if (authorLink) {
-                        const match = authorLink.href.match(/user\\/([^/?]+)/);
+                        const match = authorLink.href.match(/user\/([^/?]+)/);
                         result.author_id = match ? match[1] : '';
                     }
-                    
-                    const fansEls = document.querySelectorAll('[class*="EBi41nRR"]');
-                    if (fansEls.length >= 2) {
-                        result.fans_count = fansEls[0].textContent.trim();
-                        result.liked_count = fansEls[1].textContent.trim();
+
+                    // 如果旧方法没有获取到粉丝数
+                    if (!result.fans_count || result.fans_count === '0') {
+                        const fansEls = document.querySelectorAll('[class*="EBi41nRR"]');
+                        if (fansEls.length >= 2) {
+                            result.fans_count = fansEls[0].textContent.trim();
+                            result.liked_count = fansEls[1].textContent.trim();
+                        }
                     }
-                    
+
+                    // 提取发布时间
+                    const publishTimeEl = document.querySelector('[data-e2e="detail-video-publish-time"]');
+                    if (publishTimeEl) {
+                        const timeText = publishTimeEl.innerText.trim();
+                        const timeMatch = timeText.match(/发布时间[：:]\s*(.+)/);
+                        if (timeMatch) {
+                            result.publish_time = timeMatch[1].trim();
+                        }
+                    }
+
+                    // 提取作者签名
                     const sigEl = document.querySelector('[class*="signature"], [class*="bio"], [class*="introduction"]');
                     result.author_signature = sigEl ? sigEl.textContent.trim() : '';
-                    
+
+                    // 提取IP属地
                     const ipEl = document.querySelector('[class*="ip-location"], [class*="location"]');
                     if (ipEl) {
                         const ipText = ipEl.textContent.trim();
                         result.ip_location = ipText.replace('IP:', '').replace('IP:', '').replace('IP属地:', '').trim();
                     }
-                    
+
                     return result;
                 }
             """)
@@ -1838,7 +1840,7 @@ class DouyinCrawler:
         except Exception as e:
             logger.error(f"提取基础信息失败: {e}")
             return {}
-    
+
     async def _extract_images_from_page(self) -> list:
         """从页面提取图文内容的图片URL列表"""
         try:
